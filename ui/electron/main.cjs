@@ -555,6 +555,8 @@ let butlerFloatWindow = null;
 let butlerAgentWindow = null;
 /** Detached secret utility / image studio (own OS window). */
 let butlerUtilityWindow = null;
+/** When true, allow the utility window to actually destroy (app quit / agent exit). */
+let butlerUtilityForceClose = false;
 
 const sessions = new Map();
 const projectsRoot =
@@ -1253,6 +1255,15 @@ function startKnowledgeApi() {
       USE_COMFYUI: String(process.env.USE_COMFYUI || '1'),
       ...(sdPath ? { SD_PROJECT_PATH: sdPath } : {}),
     };
+    // Keep Knowledge on the same Comfy input/output roots as the desktop spawn (JIT decode + sweeps).
+    if (app.isPackaged) {
+      const tempRoot = getDesktopComfyTempRoot();
+      env.BUTLER_COMFY_TEMP_ROOT = tempRoot;
+      env.BUTLER_COMFY_INPUT_DIR = path.join(tempRoot, 'input');
+      env.COMFYUI_INPUT_DIR = env.BUTLER_COMFY_INPUT_DIR;
+      env.BUTLER_COMFY_OUTPUT_DIR = path.join(tempRoot, 'output');
+      env.COMFYUI_OUTPUT_DIR = env.BUTLER_COMFY_OUTPUT_DIR;
+    }
 
     const apiPy = path.join(knowledgeDir, 'api_server.py');
     if (!fs.existsSync(apiPy)) return;
@@ -4972,8 +4983,17 @@ async function startInternalApiServer() {
   }
 
   function easySweepPaths() {
-    const comfyRoot = path.join(getSdProjectPath(), 'ComfyUI');
-    const outputRoot = path.join(comfyRoot, 'output');
+    // Packaged desktop Comfy uses --output-directory under %TEMP%\butler-comfyui-desktop
+    // (BUTLER_COMFY_OUTPUT_DIR). Dev may still use sd/ComfyUI/output.
+    const envOut = String(
+      process.env.BUTLER_COMFY_OUTPUT_DIR || process.env.COMFYUI_OUTPUT_DIR || '',
+    ).trim();
+    const tempRoot = String(process.env.BUTLER_COMFY_TEMP_ROOT || '').trim();
+    const outputRoot = envOut
+      ? path.resolve(envOut)
+      : tempRoot
+        ? path.join(path.resolve(tempRoot), 'output')
+        : path.join(getSdProjectPath(), 'ComfyUI', 'output');
     return {
       outputRoot,
       sweepDir: path.join(outputRoot, 'easy_sweep'),
@@ -4981,10 +5001,45 @@ async function startInternalApiServer() {
     };
   }
 
+  const SWEEP_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|enc)$/i;
+  const SWEEP_ENC_KEY = 'butler-sweep-secure-key-2024';
+
+  /** Decode ButlerSweepSave .enc (XOR) for Butler UI; pass through real images. */
+  function decodeSweepImageBytes(rawData, relPath) {
+    const buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData || []);
+    if (!buf.length) return buf;
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      return buf;
+    }
+    if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) return buf;
+    if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
+      return buf;
+    }
+    const low = String(relPath || '').toLowerCase();
+    const looksPlainExt =
+      /\.(?:png|jpe?g|webp|gif)$/i.test(low) && !low.endsWith('.enc');
+    if (looksPlainExt) return buf;
+    const decoded = Buffer.alloc(buf.length);
+    for (let i = 0; i < buf.length; i++) {
+      decoded[i] = buf[i] ^ SWEEP_ENC_KEY.charCodeAt(i % SWEEP_ENC_KEY.length);
+    }
+    if (
+      (decoded.length >= 8 &&
+        decoded[0] === 0x89 &&
+        decoded[1] === 0x50 &&
+        decoded[2] === 0x4e &&
+        decoded[3] === 0x47) ||
+      (decoded.length >= 2 && decoded[0] === 0xff && decoded[1] === 0xd8)
+    ) {
+      return decoded;
+    }
+    return low.endsWith('.enc') ? decoded : buf;
+  }
+
   function presetFromEasySweepFilename(filename) {
     const base = String(filename || '').replace(/\\/g, '/').split('/').pop() || '';
     const match = base.match(
-      /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+      /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
     );
     const preset = match?.[1] || '';
     return EASY_SWEEP_PRESETS.has(preset) ? preset : '';
@@ -4993,16 +5048,20 @@ async function startInternalApiServer() {
   function easySweepRunGroupKey(relPath) {
     const normalized = String(relPath || '').replace(/\\/g, '/');
     const parts = normalized.split('/').filter(Boolean);
+    // Paths are relative to easy_sweep/: <run_folder>/<file>  OR legacy easy_sweep/<run>/…
     if (parts.length >= 2 && parts[0] === 'easy_sweep') {
       return parts[1];
     }
+    if (parts.length >= 2) {
+      return parts[0];
+    }
     const base = parts[parts.length - 1] || '';
     const withRun = base.match(
-      /^(.+?_(?:single|sweep_winners|sweep_20)_r.+?)(?:_s\d+)(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+      /^(.+?_(?:single|sweep_winners|sweep_20)_r.+?)(?:_s\d+)(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
     );
     if (withRun?.[1]) return withRun[1];
     const modeMatch = base.match(
-      /^(.+?)_(sweep_20|sweep_winners|single)_s\d+(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+      /^(.+?)_(sweep_20|sweep_winners|single)_s\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
     );
     if (modeMatch?.[2]) {
       return 'legacy_' + modeMatch[2];
@@ -5031,7 +5090,7 @@ async function startInternalApiServer() {
         const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           await walk(full, rel);
-        } else if (entry.isFile() && /\.(?:png|jpe?g|webp)$/i.test(entry.name)) {
+        } else if (entry.isFile() && SWEEP_IMAGE_EXT_RE.test(entry.name)) {
           results.push({ full, rel });
         }
       }
@@ -5186,7 +5245,7 @@ async function startInternalApiServer() {
 
   api.get('/api/sd/img2img/sweep-image/*', async (req, res) => {
     const relPath = String(req.params[0] || '').replace(/\\/g, '/');
-    if (!relPath || !/\.(?:png|jpe?g|webp|enc)$/i.test(relPath)) {
+    if (!relPath || !SWEEP_IMAGE_EXT_RE.test(relPath)) {
       return res.status(400).json({ ok: false, message: 'Invalid sweep image filename.' });
     }
     if (relPath.includes('..')) {
@@ -5198,26 +5257,12 @@ async function startInternalApiServer() {
       const info = await fsp.stat(full);
       if (!info.isFile()) throw new Error('Not a file');
 
-      const rawData = fs.readFileSync(full);
-      const ENCRYPTION_KEY = 'butler-sweep-secure-key-2024';
-      if (relPath.toLowerCase().endsWith('.enc')) {
-        const decoded = Buffer.alloc(rawData.length);
-        for (let i = 0; i < rawData.length; i++) {
-          decoded[i] = rawData[i] ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length);
-        }
-        res.setHeader('Cache-Control', 'private, max-age=60');
-        res.setHeader('Content-Type', 'image/png');
-        return res.send(decoded);
-      }
-
-      const encoded = Buffer.alloc(rawData.length);
-      for (let i = 0; i < rawData.length; i++) {
-        encoded[i] = rawData[i] ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length);
-      }
-
+      // Privacy-at-rest: .enc on disk; Butler UI always receives decoded image bytes.
+      const decoded = decodeSweepImageBytes(fs.readFileSync(full), relPath);
+      const isJpeg = decoded.length >= 2 && decoded[0] === 0xff && decoded[1] === 0xd8;
       res.setHeader('Cache-Control', 'private, max-age=60');
-      res.setHeader('Content-Type', 'image/png');
-      return res.send(encoded);
+      res.setHeader('Content-Type', isJpeg ? 'image/jpeg' : 'image/png');
+      return res.send(decoded);
     } catch {
       return res.status(404).json({ ok: false, message: 'Sweep image not found.' });
     }
@@ -5232,7 +5277,7 @@ async function startInternalApiServer() {
       const presets = [];
       for (const raw of requested) {
         const relPath = String(raw || '').replace(/\\/g, '/');
-        if (!relPath || relPath.includes('..') || !/\.(?:png|jpe?g|webp|enc)$/i.test(relPath)) continue;
+        if (!relPath || relPath.includes('..') || !SWEEP_IMAGE_EXT_RE.test(relPath)) continue;
         const preset = presetFromEasySweepFilename(relPath);
         if (!preset) continue;
         const full = path.join(sweepDir, relPath.split('/').join(path.sep));
@@ -5542,13 +5587,44 @@ function getButlerUtilityUrl() {
     : 'http://localhost:' + API_PORT + '/#agent-utility';
 }
 
+/** Hide utility window without destroying React state (reopen via secret chord only). */
+function hideButlerUtilityWindow() {
+  if (butlerUtilityWindow && !butlerUtilityWindow.isDestroyed()) {
+    butlerUtilityWindow.hide();
+  }
+}
+
+/** Tear down utility window for real (app quit or Agent window closed). */
+function destroyButlerUtilityWindow() {
+  if (!butlerUtilityWindow || butlerUtilityWindow.isDestroyed()) {
+    butlerUtilityWindow = null;
+    butlerUtilityForceClose = false;
+    return;
+  }
+  butlerUtilityForceClose = true;
+  try {
+    butlerUtilityWindow.destroy();
+  } catch (_) {
+    try {
+      butlerUtilityWindow.close();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  butlerUtilityWindow = null;
+  butlerUtilityForceClose = false;
+}
+
 function createButlerUtilityWindow() {
   const preloadPath = path.join(__dirname, 'preload.cjs');
+  // Re-show existing window — do NOT reload URL (preserves studio state).
   if (butlerUtilityWindow && !butlerUtilityWindow.isDestroyed()) {
+    if (butlerUtilityWindow.isMinimized()) butlerUtilityWindow.restore();
     butlerUtilityWindow.show();
     butlerUtilityWindow.focus();
     return butlerUtilityWindow;
   }
+  butlerUtilityForceClose = false;
   butlerUtilityWindow = new BrowserWindow({
     width: 920,
     height: 780,
@@ -5558,6 +5634,8 @@ function createButlerUtilityWindow() {
     title: 'Butler Utility',
     backgroundColor: '#0d0a06',
     autoHideMenuBar: true,
+    skipTaskbar: true,
+    show: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -5565,8 +5643,15 @@ function createButlerUtilityWindow() {
       webviewTag: true,
     },
   });
+  // Close / Escape / Esc → hide (keep process + page state). Destroy only on app quit.
+  butlerUtilityWindow.on('close', (e) => {
+    if (butlerUtilityForceClose) return;
+    e.preventDefault();
+    butlerUtilityWindow.hide();
+  });
   butlerUtilityWindow.on('closed', () => {
     butlerUtilityWindow = null;
+    butlerUtilityForceClose = false;
   });
   butlerUtilityWindow.loadURL(getButlerUtilityUrl());
   return butlerUtilityWindow;
@@ -5727,10 +5812,8 @@ ipcMain.handle('butler-utility-open', async () => {
 });
 
 ipcMain.handle('butler-utility-close', async () => {
-  if (butlerUtilityWindow && !butlerUtilityWindow.isDestroyed()) {
-    butlerUtilityWindow.close();
-    butlerUtilityWindow = null;
-  }
+  // Close button / Escape → hide only; state persists until Butler quits.
+  hideButlerUtilityWindow();
 });
 
 ipcMain.handle('butler-utility-side-send', async (_event, payload) => {
@@ -5767,10 +5850,8 @@ function createButlerAgentStandaloneWindow() {
   });
   butlerAgentWindow.on('closed', () => {
     butlerAgentWindow = null;
-    if (butlerUtilityWindow && !butlerUtilityWindow.isDestroyed()) {
-      butlerUtilityWindow.close();
-      butlerUtilityWindow = null;
-    }
+    // Agent gone → destroy utility (session ends); state clears with the app process.
+    destroyButlerUtilityWindow();
   });
   const isDev = !app.isPackaged;
   if (isDev) {
@@ -5915,6 +5996,10 @@ app.whenReady().then(async () => {
       else createButlerAgentStandaloneWindow();
     })();
   }
+});
+
+app.on('before-quit', () => {
+  destroyButlerUtilityWindow();
 });
 
 app.on('will-quit', () => {

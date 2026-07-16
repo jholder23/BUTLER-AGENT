@@ -68,3 +68,6 @@ credentials.json
 tools/ffmpeg/
 ui/installers/*.exe
 
+
+butler-agent-only.bundle
+

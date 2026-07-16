@@ -846,6 +846,10 @@ def _workflows_dir() -> Path:
 
 
 def _easy_sweep_output_root() -> Path:
+    """Comfy output root used for easy_sweep / winners (honors desktop BUTLER_COMFY_OUTPUT_DIR)."""
+    root = _comfy_folder_dir("output")
+    if root is not None:
+        return root
     base = _sd_project_path() or os.path.expanduser("~")
     return Path(base) / "ComfyUI" / "output"
 

@@ -263,6 +263,8 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
   const [viewerFullscreen, setViewerFullscreen] = useState(false);
+  /** sweep gallery vs single/session returns in the detached utility menu */
+  const [viewerSource, setViewerSource] = useState<'sweep' | 'single'>('sweep');
   const [viewAllRuns, setViewAllRuns] = useState(false);
   const sweepProgressInterval = useRef<number | null>(null);
   const [promptPresets, setPromptPresets] = useState<SavedPromptPreset[]>([]);
@@ -664,14 +666,39 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
 
   const openViewer = (index: number) => {
     const clamped = Math.max(0, Math.min(index, sweepItems.length - 1));
+    setViewerSource('sweep');
     setViewerIndex(clamped);
     setViewerOpen(true);
+    setViewerFullscreen(true);
+  };
+
+  const openSingleViewer = (index: number) => {
+    const clamped = Math.max(0, Math.min(index, outputUrls.length - 1));
+    setViewerSource('single');
+    setViewerIndex(clamped);
+    setViewerOpen(true);
+    setViewerFullscreen(true);
   };
 
   const closeViewer = () => {
     setViewerOpen(false);
     setViewerFullscreen(false);
   };
+
+  const viewerCount =
+    viewerSource === 'single' ? outputUrls.length : sweepItems.length;
+  const viewerItemUrl =
+    viewerSource === 'single'
+      ? outputUrls[viewerIndex]?.url || ''
+      : sweepItems[viewerIndex]
+        ? butlerApiUrl(sweepItems[viewerIndex].image_url)
+        : '';
+  const viewerItemLabel =
+    viewerSource === 'single'
+      ? outputUrls[viewerIndex]?.label || `Result ${viewerIndex + 1}`
+      : sweepItems[viewerIndex]
+        ? `${sweepItems[viewerIndex].preset} · ${sweepItems[viewerIndex].filename}`
+        : '';
 
   // Keyboard navigation for the viewer modal
   useEffect(() => {
@@ -689,16 +716,16 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [viewerOpen, sweepItems.length]);
+  }, [viewerOpen, viewerCount, viewerSource]);
 
   const showPreviousViewer = () => {
-    if (sweepItems.length === 0) return;
-    setViewerIndex((current) => (current - 1 + sweepItems.length) % sweepItems.length);
+    if (viewerCount === 0) return;
+    setViewerIndex((current) => (current - 1 + viewerCount) % viewerCount);
   };
 
   const showNextViewer = () => {
-    if (sweepItems.length === 0) return;
-    setViewerIndex((current) => (current + 1) % sweepItems.length);
+    if (viewerCount === 0) return;
+    setViewerIndex((current) => (current + 1) % viewerCount);
   };
 
   const toggleWinner = (filename: string) => {
@@ -847,7 +874,8 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
       setStatusLine(msg);
       pushLog(msg);
       if (out.path) pushLog(`Saved: ${out.path}`);
-      if (showSweepGallery) await loadSweepResults();
+      setShowSweepGallery(true);
+      await loadSweepResults();
     } catch (e: unknown) {
       let msg = String((e as Error)?.message || e);
       if (/aborted|timeout|timed out/i.test(msg)) {
@@ -866,18 +894,6 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
     } finally {
       cancelSweepProgressPolling();
       setBusy(false);
-    }
-  };
-
-  const openPath = async (p: string, action: 'open' | 'reveal' = 'reveal') => {
-    try {
-      await fetchButlerJson('/api/open_path', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: p, action }),
-      });
-    } catch (e: unknown) {
-      setErr(String((e as Error)?.message || e));
     }
   };
 
@@ -1498,38 +1514,8 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
                 ? 'Run FaceID + pose control'
                 : 'Run easy img2img'}
         </button>
-        {result?.path ? (
-          <>
-            <button
-              type="button"
-              className="settings-secondary-btn"
-              onClick={() => void openPath(result.path!, 'reveal')}
-              disabled={busy}
-            >
-              Show file
-            </button>
-            <button
-              type="button"
-              className="settings-secondary-btn"
-              onClick={() => void openPath(result.path!, 'open')}
-              disabled={busy}
-            >
-              Open folder
-            </button>
-          </>
-        ) : null}
       </div>
 
-      {outputUrls.length > 0 ? (
-        <div className="settings-generated-images-grid secret-menu-generated-grid" style={{ marginTop: 14 }}>
-          {outputUrls.map((it, i) => (
-            <figure key={`${it.url}-${i}`} className="settings-generated-image-card">
-              {it.label ? <figcaption className="settings-generated-image-caption">{it.label}</figcaption> : null}
-              <img src={it.url} alt={it.label || 'Generated image'} className="settings-generated-image-thumb" />
-            </figure>
-          ))}
-        </div>
-      ) : null}
       {sweepProgressTotal !== null ? (
         <div style={{ marginTop: 10, width: '100%' }}>
           <div
@@ -1556,13 +1542,54 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
         </div>
       ) : null}
 
-      {showSweepControls ? (
       <div style={{ marginTop: 14 }}>
         <button type="button" className="settings-secondary-btn" onClick={toggleSweepGallery} disabled={sweepBusy}>
-          {showSweepGallery ? 'Hide sweep results' : 'View & select sweep winners'}
+          {showSweepGallery ? 'Hide results' : 'View Results'}
         </button>
         {showSweepGallery ? (
           <div style={{ marginTop: 10 }}>
+            <p className="settings-desc" style={{ marginTop: 0 }}>
+              Decoded Comfy returns in Butler — singles and sweep runs. Click an image for fullscreen.
+            </p>
+            {outputUrls.length > 0 ? (
+              <div style={{ marginBottom: 14 }}>
+                <p className="settings-desc secret-menu-prompting-title" style={{ margin: '0 0 8px' }}>
+                  This session
+                </p>
+                <div className="settings-generated-images-grid secret-menu-generated-grid">
+                  {outputUrls.map((it, i) => (
+                    <figure key={`session-${it.url}-${i}`} className="settings-generated-image-card">
+                      <button
+                        type="button"
+                        className="settings-generated-image-thumb-button"
+                        onClick={() => openSingleViewer(i)}
+                        title="Open fullscreen viewer"
+                        style={{
+                          border: 'none',
+                          padding: 0,
+                          margin: 0,
+                          background: 'transparent',
+                          cursor: 'pointer',
+                          width: '100%',
+                          textAlign: 'left',
+                        }}
+                      >
+                        <img
+                          src={it.url}
+                          alt={it.label || 'Generated image'}
+                          className="settings-generated-image-thumb"
+                          style={{ width: '100%', height: 'auto' }}
+                        />
+                      </button>
+                      <figcaption className="settings-generated-image-caption">
+                        {it.label || `Single ${i + 1}`}
+                      </figcaption>
+                    </figure>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {showSweepControls ? (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
               <button
                 type="button"
@@ -1591,7 +1618,20 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
               </button>
               <span className="settings-desc">{sweepStatus}</span>
             </div>
-            {runGroups.length > 1 ? (
+            ) : (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                <button
+                  type="button"
+                  className="settings-secondary-btn"
+                  onClick={() => void loadSweepResults(true)}
+                  disabled={sweepBusy}
+                >
+                  Refresh
+                </button>
+                <span className="settings-desc">{sweepStatus}</span>
+              </div>
+            )}
+            {showSweepControls && runGroups.length > 1 ? (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
                 {runGroups.map((run) => (
                   <button
@@ -1606,10 +1646,12 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
                 ))}
               </div>
             ) : null}
+            {showSweepControls ? (
             <p className="settings-desc" style={{ marginTop: 8 }}>
               Selected images define the presets used by MODE=sweep_winners. Selecting multiple images from one preset
               still counts as one winning preset.
             </p>
+            ) : null}
             {sweepProgressTotal !== null ? (
               <div style={{ marginTop: 8, width: '100%' }}>
                 <div
@@ -1639,12 +1681,14 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
               <div className="settings-generated-images-grid secret-menu-generated-grid" style={{ marginTop: 10 }}>
                 {sweepItems.map((item, index) => {
                   const selected = winnerDraft.has(item.filename);
+                  const isSingle = /_single_/i.test(item.filename);
                   return (
                     <figure
                       key={item.filename}
                       className="settings-generated-image-card"
                       style={selected ? { borderColor: 'var(--accent)', boxShadow: '0 0 0 1px var(--accent)' } : undefined}
                     >
+                      {showSweepControls ? (
                       <label className="secret-menu-checkbox-row" style={{ margin: 0 }}>
                         <input
                           type="checkbox"
@@ -1652,13 +1696,20 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
                           onChange={() => toggleWinner(item.filename)}
                           disabled={sweepBusy}
                         />
-                        <span>Winner · {item.preset}</span>
+                        <span>
+                          {isSingle ? 'Single' : 'Winner'} · {item.preset}
+                        </span>
                       </label>
+                      ) : (
+                        <p className="settings-desc" style={{ margin: '0 0 4px' }}>
+                          {isSingle ? 'Single' : 'Sweep'} · {item.preset}
+                        </p>
+                      )}
                       <button
                         type="button"
                         className="settings-generated-image-thumb-button"
                         onClick={() => openViewer(index)}
-                        title="Open sweep image viewer"
+                        title="Open fullscreen viewer"
                         style={{
                           border: 'none',
                           padding: 0,
@@ -1671,7 +1722,7 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
                       >
                         <img
                           src={butlerApiUrl(item.image_url)}
-                          alt={`${item.preset} sweep result`}
+                          alt={`${item.preset} result`}
                           className="settings-generated-image-thumb"
                           loading="lazy"
                           style={{ width: '100%', height: 'auto' }}
@@ -1684,132 +1735,160 @@ export function Img2ImgPanel({ embedded = false, poseReference = null, studioMod
                   );
                 })}
               </div>
-            ) : null}
-            {viewerOpen && sweepItems.length > 0 ? (
-              <div
-                className="settings-modal-backdrop"
-                style={{ zIndex: 10500 }}
-                onClick={(e) => {
-                  if (e.target === e.currentTarget) closeViewer();
-                }}
-              >
-                <div
-                  className="settings-modal settings-modal--wide"
-                  role="dialog"
-                  aria-modal="true"
-                  style={viewerFullscreen ? {
+            ) : (
+              <p className="settings-desc" style={{ marginTop: 10 }}>
+                {outputUrls.length ? 'No saved disk results yet — session images above.' : 'No results yet. Run a single or sweep, then refresh.'}
+              </p>
+            )}
+          </div>
+        ) : null}
+      </div>
+
+      {viewerOpen && viewerCount > 0 && viewerItemUrl ? (
+        <div
+          className="settings-modal-backdrop"
+          style={{ zIndex: 10500 }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeViewer();
+          }}
+        >
+          <div
+            className="settings-modal settings-modal--wide"
+            role="dialog"
+            aria-modal="true"
+            style={
+              viewerFullscreen
+                ? {
                     maxWidth: '100vw',
                     maxHeight: '100vh',
                     width: '100vw',
                     height: '100vh',
                     borderRadius: 0,
                     margin: 0,
-                  } : { maxWidth: '96vw', maxHeight: '90vh' }}
+                  }
+                : { maxWidth: '96vw', maxHeight: '90vh' }
+            }
+          >
+            <div className="settings-modal-header" style={{ justifyContent: 'space-between', gap: 12 }}>
+              <h2 className="settings-modal-title">
+                Image viewer {viewerFullscreen ? '(fullscreen)' : ''}
+              </h2>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {viewerSource === 'sweep' && sweepItems[viewerIndex] ? (
+                  <button
+                    type="button"
+                    className="settings-save"
+                    onClick={async () => {
+                      const item = sweepItems[viewerIndex];
+                      if (!item) return;
+                      setWinnerDraft((current) => {
+                        const next = new Set(current);
+                        if (next.has(item.filename)) next.delete(item.filename);
+                        else next.add(item.filename);
+                        return next;
+                      });
+                      try {
+                        const nextFiles = winnerDraft.has(item.filename)
+                          ? [...winnerDraft].filter((f) => f !== item.filename)
+                          : [...winnerDraft, item.filename];
+                        await fetchButlerJson<{ ok?: boolean; message?: string }>(
+                          '/api/sd/img2img/sweep-winners',
+                          {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ files: nextFiles }),
+                          },
+                        );
+                      } catch {
+                        /* ignore */
+                      }
+                    }}
+                    title={
+                      winnerDraft.has(sweepItems[viewerIndex]?.filename)
+                        ? 'Remove from winners'
+                        : 'Mark as winner preset'
+                    }
+                    style={{ padding: '2px 10px', fontSize: '0.85em' }}
+                  >
+                    {winnerDraft.has(sweepItems[viewerIndex]?.filename) ? '★ Saved' : '☆ Save preset'}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="settings-secondary-btn"
+                  onClick={() => setViewerFullscreen((v) => !v)}
+                  aria-label="Toggle fullscreen"
+                  title="Toggle fullscreen (F)"
+                  style={{ padding: '2px 10px' }}
                 >
-                  <div className="settings-modal-header" style={{ justifyContent: 'space-between', gap: 12 }}>
-                    <h2 className="settings-modal-title">
-                      Sweep image viewer {viewerFullscreen ? '(fullscreen)' : ''}
-                    </h2>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      <button
-                        type="button"
-                        className="settings-save"
-                        onClick={async () => {
-                          const item = sweepItems[viewerIndex];
-                          if (!item) return;
-                          const isCurrentlyWinner = winnerDraft.has(item.filename);
-                          setWinnerDraft((current) => {
-                            const next = new Set(current);
-                            if (next.has(item.filename)) {
-                              next.delete(item.filename);
-                            } else {
-                              next.add(item.filename);
-                            }
-                            return next;
-                          });
-                          // Auto-save winners to API so state persists across sessions
-                          try {
-                            await fetchButlerJson<{ ok?: boolean; message?: string }>(
-                              '/api/sd/img2img/sweep-winners',
-                              {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ files: Array.from(winnerDraft.has(item.filename) ? winnerDraft : new Set([...winnerDraft].filter((f) => f !== item.filename))) }),
-                              },
-                            );
-                          } catch {
-                            // ignore transient save errors
-                          }
-                        }}
-                        title={winnerDraft.has(sweepItems[viewerIndex]?.filename) ? 'Remove from winners' : 'Mark as winner preset'}
-                        style={{ padding: '2px 10px', fontSize: '0.85em' }}
-                      >
-                        {winnerDraft.has(sweepItems[viewerIndex]?.filename) ? '★ Saved' : '☆ Save preset'}
-                      </button>
-                      <button
-                        type="button"
-                        className="settings-secondary-btn"
-                        onClick={() => setViewerFullscreen((v) => !v)}
-                        aria-label="Toggle fullscreen"
-                        title="Toggle fullscreen (F)"
-                        style={{ padding: '2px 10px' }}
-                      >
-                        {viewerFullscreen ? '🗗' : '⛶'}
-                      </button>
-                      <button type="button" className="settings-modal-close" onClick={closeViewer} aria-label="Close viewer">
-                        ×
-                      </button>
-                    </div>
-                  </div>
-                  <div className="settings-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', padding: '0 0 12px' }}>
-                    <div
-                      style={{
-                        width: '100%',
-                        maxWidth: '100%',
-                        maxHeight: viewerFullscreen ? 'calc(100vh - 130px)' : 'calc(90vh - 160px)',
-                        display: 'flex',
-                        justifyContent: 'center',
-                        alignItems: 'center',
-                      }}
-                    >
-                      <img
-                        src={butlerApiUrl(sweepItems[viewerIndex].image_url)}
-                        alt={`${sweepItems[viewerIndex].preset} sweep result ${viewerIndex + 1}`}
-                        style={{
-                          maxWidth: '100%',
-                          maxHeight: '100%',
-                          objectFit: 'contain',
-                          borderRadius: viewerFullscreen ? 0 : 10,
-                          boxShadow: '0 0 0 1px var(--border)',
-                        }}
-                      />
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
-                      <button type="button" className="settings-secondary-btn" onClick={showPreviousViewer} disabled={sweepItems.length <= 1}>
-                        ← Previous
-                      </button>
-                      <span className="settings-desc">
-                        {viewerIndex + 1} / {sweepItems.length}
-                      </span>
-                      <button type="button" className="settings-secondary-btn" onClick={showNextViewer} disabled={sweepItems.length <= 1}>
-                        Next →
-                      </button>
-                    </div>
-                    <div style={{ width: '100%', textAlign: 'center' }}>
-                      <p className="settings-desc" style={{ margin: '0.25rem 0' }}>
-                        {sweepItems[viewerIndex].preset} · {sweepItems[viewerIndex].filename}
-                      </p>
-                      <p className="settings-learn-status-line settings-learn-status--muted" style={{ margin: '0.25rem 0', fontSize: '0.8em' }}>
-                        Use ← → arrow keys to navigate · F for fullscreen · Esc to close
-                      </p>
-                    </div>
-                  </div>
-                </div>
+                  {viewerFullscreen ? '🗗' : '⛶'}
+                </button>
+                <button type="button" className="settings-modal-close" onClick={closeViewer} aria-label="Close viewer">
+                  ×
+                </button>
               </div>
-            ) : null}
+            </div>
+            <div
+              className="settings-modal-body"
+              style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', padding: '0 0 12px' }}
+            >
+              <div
+                style={{
+                  width: '100%',
+                  maxWidth: '100%',
+                  maxHeight: viewerFullscreen ? 'calc(100vh - 130px)' : 'calc(90vh - 160px)',
+                  display: 'flex',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                }}
+              >
+                <img
+                  src={viewerItemUrl}
+                  alt={viewerItemLabel || `Result ${viewerIndex + 1}`}
+                  style={{
+                    maxWidth: '100%',
+                    maxHeight: '100%',
+                    objectFit: 'contain',
+                    borderRadius: viewerFullscreen ? 0 : 10,
+                    boxShadow: '0 0 0 1px var(--border)',
+                  }}
+                />
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+                <button
+                  type="button"
+                  className="settings-secondary-btn"
+                  onClick={showPreviousViewer}
+                  disabled={viewerCount <= 1}
+                >
+                  ← Previous
+                </button>
+                <span className="settings-desc">
+                  {viewerIndex + 1} / {viewerCount}
+                </span>
+                <button
+                  type="button"
+                  className="settings-secondary-btn"
+                  onClick={showNextViewer}
+                  disabled={viewerCount <= 1}
+                >
+                  Next →
+                </button>
+              </div>
+              <div style={{ width: '100%', textAlign: 'center' }}>
+                <p className="settings-desc" style={{ margin: '0.25rem 0' }}>
+                  {viewerItemLabel}
+                </p>
+                <p
+                  className="settings-learn-status-line settings-learn-status--muted"
+                  style={{ margin: '0.25rem 0', fontSize: '0.8em' }}
+                >
+                  Use ← → arrow keys to navigate · F for fullscreen · Esc to close
+                </p>
+              </div>
+            </div>
           </div>
-        ) : null}
-      </div>
+        </div>
       ) : null}
 
       {activityLog.length > 0 ? (

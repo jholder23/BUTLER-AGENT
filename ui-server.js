@@ -4106,8 +4106,13 @@ app.delete('/api/sd/img2img/prompt-presets/:id', async (req, res) => {
 });
 
 function easySweepPaths() {
-  const comfyRoot = path.join(resolveSdProjectPath(path.resolve(__dirname)), 'ComfyUI');
-  const outputRoot = path.join(comfyRoot, 'output');
+  const envOut = String(process.env.BUTLER_COMFY_OUTPUT_DIR || process.env.COMFYUI_OUTPUT_DIR || '').trim();
+  const tempRoot = String(process.env.BUTLER_COMFY_TEMP_ROOT || '').trim();
+  const outputRoot = envOut
+    ? path.resolve(envOut)
+    : tempRoot
+      ? path.join(path.resolve(tempRoot), 'output')
+      : path.join(resolveSdProjectPath(path.resolve(__dirname)), 'ComfyUI', 'output');
   return {
     outputRoot,
     sweepDir: path.join(outputRoot, 'easy_sweep'),
@@ -4115,39 +4120,67 @@ function easySweepPaths() {
   };
 }
 
+const SWEEP_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|enc)$/i;
+const SWEEP_ENC_KEY = 'butler-sweep-secure-key-2024';
+
+/** Decode ButlerSweepSave .enc (XOR) for Butler UI; pass through real images. */
+function decodeSweepImageBytes(rawData, relPath) {
+  const buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData || []);
+  if (!buf.length) return buf;
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return buf;
+  }
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) return buf;
+  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
+    return buf;
+  }
+  const low = String(relPath || '').toLowerCase();
+  const looksPlainExt = /\.(?:png|jpe?g|webp|gif)$/i.test(low) && !low.endsWith('.enc');
+  if (looksPlainExt) return buf;
+  const decoded = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i++) {
+    decoded[i] = buf[i] ^ SWEEP_ENC_KEY.charCodeAt(i % SWEEP_ENC_KEY.length);
+  }
+  if (
+    (decoded.length >= 8 &&
+      decoded[0] === 0x89 &&
+      decoded[1] === 0x50 &&
+      decoded[2] === 0x4e &&
+      decoded[3] === 0x47) ||
+    (decoded.length >= 2 && decoded[0] === 0xff && decoded[1] === 0xd8)
+  ) {
+    return decoded;
+  }
+  return low.endsWith('.enc') ? decoded : buf;
+}
+
 function presetFromEasySweepFilename(filename) {
-  // New format: easy_sweep/<run_folder>/<preset>_<mode>_s<seed>_<idx>.png
-  // The basename is the last path segment after the final separator.
+  // New format: easy_sweep/<run_folder>/<preset>_<mode>_s<seed>_<idx>.png|.enc
   const base = String(filename || '').replace(/\\/g, '/').split('/').pop() || '';
   const match = base.match(
-    /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+    /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
   );
   const preset = match?.[1] || '';
   return EASY_SWEEP_PRESETS.has(preset) ? preset : '';
 }
 
 function easySweepRunGroupKey(relPath) {
-  // New layout: easy_sweep/<run_folder>/<preset>_<mode>_s<seed>_<idx>.png
-  // The run group key is the run_folder (the directory containing the image).
+  // Layout under sweepDir: <run_folder>/<preset>_<mode>_s<seed>_<idx>.enc
   const normalized = String(relPath || '').replace(/\\/g, '/');
   const parts = normalized.split('/').filter(Boolean);
-  // parts[0] should be 'easy_sweep', parts[1] is the run folder
   if (parts.length >= 2 && parts[0] === 'easy_sweep') {
     return parts[1];
   }
-  // Fallback for legacy flat files (no subfolder, no run ID):
-  // Files like 02_soft_face_sweep_20_s1_000.png — group all sweep_20 files
-  // that share the same mode together as one legacy run.
+  if (parts.length >= 2) {
+    return parts[0];
+  }
   const base = parts[parts.length - 1] || '';
-  // First try: files with _r<run_id> suffix
   const withRun = base.match(
-    /^(.+?_(?:single|sweep_winners|sweep_20)_r.+?)(?:_s\d+)(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+    /^(.+?_(?:single|sweep_winners|sweep_20)_r.+?)(?:_s\d+)(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
   );
   if (withRun?.[1]) return withRun[1];
-  // Legacy flat files without run ID: group by mode (sweep_20, sweep_winners, single)
-  // All sweep_20 files from the old format go into one "legacy_sweep_20" group.
   const modeMatch = base.match(
-    /^(.+?)_(sweep_20|sweep_winners|single)_s\d+(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+    /^(.+?)_(sweep_20|sweep_winners|single)_s\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
   );
   if (modeMatch?.[2]) {
     return 'legacy_' + modeMatch[2];
@@ -4177,7 +4210,7 @@ async function collectSweepImages(sweepDir) {
       const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         await walk(full, rel);
-      } else if (entry.isFile() && /\.(?:png|jpe?g|webp)$/i.test(entry.name)) {
+      } else if (entry.isFile() && SWEEP_IMAGE_EXT_RE.test(entry.name)) {
         results.push({ full, rel });
       }
     }
@@ -4245,7 +4278,7 @@ app.get('/api/sd/img2img/sweep-results', async (_req, res) => {
 
 app.get('/api/sd/img2img/sweep-image/*', async (req, res) => {
   const relPath = String(req.params[0] || '').replace(/\\/g, '/');
-  if (!relPath || !/\.(?:png|jpe?g|webp|enc)$/i.test(relPath)) {
+  if (!relPath || !SWEEP_IMAGE_EXT_RE.test(relPath)) {
     return res.status(400).json({ ok: false, message: 'Invalid sweep image filename.' });
   }
   if (relPath.includes('..')) {
@@ -4256,32 +4289,14 @@ app.get('/api/sd/img2img/sweep-image/*', async (req, res) => {
     const full = path.join(sweepDir, relPath.split('/').join(path.sep));
     const info = await stat(full);
     if (!info.isFile()) throw new Error('Not a file');
-    
+
     const fs = require('fs');
-    const rawData = fs.readFileSync(full);
-    
-    // Handle encoded .enc files - decode them
-    if (relPath.toLowerCase().endsWith('.enc')) {
-      const ENCRYPTION_KEY = 'butler-sweep-secure-key-2024';
-      const decoded = Buffer.alloc(rawData.length);
-      for (let i = 0; i < rawData.length; i++) {
-        decoded[i] = rawData[i] ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length);
-      }
-      res.setHeader('Cache-Control', 'private, max-age=60');
-      res.setHeader('Content-Type', 'image/png');
-      return res.send(decoded);
-    }
-    
-    // Encode all sweep result images for Butler-only visibility
-    const ENCRYPTION_KEY = 'butler-sweep-secure-key-2024';
-    const encoded = Buffer.alloc(rawData.length);
-    for (let i = 0; i < rawData.length; i++) {
-      encoded[i] = rawData[i] ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length);
-    }
-    
+    // Privacy-at-rest: .enc on disk; Butler UI always receives decoded image bytes.
+    const decoded = decodeSweepImageBytes(fs.readFileSync(full), relPath);
+    const isJpeg = decoded.length >= 2 && decoded[0] === 0xff && decoded[1] === 0xd8;
     res.setHeader('Cache-Control', 'private, max-age=60');
-    res.setHeader('Content-Type', 'image/png');
-    return res.send(encoded);
+    res.setHeader('Content-Type', isJpeg ? 'image/jpeg' : 'image/png');
+    return res.send(decoded);
   } catch {
     return res.status(404).json({ ok: false, message: 'Sweep image not found.' });
   }
@@ -4296,7 +4311,7 @@ app.post('/api/sd/img2img/sweep-winners', async (req, res) => {
     const presets = [];
     for (const raw of requested) {
       const relPath = String(raw || '').replace(/\\/g, '/');
-      if (!relPath || relPath.includes('..') || !/\.(?:png|jpe?g|webp|enc)$/i.test(relPath)) continue;
+      if (!relPath || relPath.includes('..') || !SWEEP_IMAGE_EXT_RE.test(relPath)) continue;
       const preset = presetFromEasySweepFilename(relPath);
       if (!preset) continue;
       const full = path.join(sweepDir, relPath.split('/').join(path.sep));

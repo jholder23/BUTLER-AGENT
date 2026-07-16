@@ -6,7 +6,7 @@ import {
 
 /**
  * Detached OS window for the secret utility / image studio (#agent-utility).
- * Opened via Q+W+E + far-left logo; closed with the window chrome or Close.
+ * Close / Esc hides the BrowserWindow (state kept); reopen only via Q+W+E + logo.
  */
 export function AgentUtilityWindow() {
   useEffect(() => {
@@ -18,6 +18,7 @@ export function AgentUtilityWindow() {
   }, []);
 
   const onClose = useCallback(() => {
+    // Prefer IPC hide (persists React state). window.close() is also intercepted in main.
     if (window.butlerElectron?.closeAgentUtility) {
       void window.butlerElectron.closeAgentUtility();
       return;
