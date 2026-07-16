@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="sphere" cx="34%" cy="30%" r="68%">
+      <stop offset="0%" stop-color="#4a6d8c"/>
+      <stop offset="45%" stop-color="#1e3a52"/>
+      <stop offset="100%" stop-color="#0a1522"/>
+    </radialGradient>
+    <radialGradient id="sphereShade" cx="50%" cy="50%" r="55%">
+      <stop offset="55%" stop-color="transparent"/>
+      <stop offset="100%" stop-color="#000" stop-opacity="0.42"/>
+    </radialGradient>
+    <linearGradient id="bezel" x1="8%" y1="12%" x2="92%" y2="88%">
+      <stop offset="0%" stop-color="#f7f0e4"/>
+      <stop offset="22%" stop-color="#d4b896"/>
+      <stop offset="48%" stop-color="#b8925a"/>
+      <stop offset="78%" stop-color="#8b6b3d"/>
+      <stop offset="100%" stop-color="#5c4428"/>
+    </linearGradient>
+    <linearGradient id="bezelHi" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fff" stop-opacity="0.55"/>
+      <stop offset="40%" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000" stop-opacity="0.2"/>
+    </linearGradient>
+    <linearGradient id="stache" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="35%" stop-color="#cbd5e1"/>
+      <stop offset="100%" stop-color="#64748b"/>
+    </linearGradient>
+    <linearGradient id="stacheShadow" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#94a3b8"/>
+      <stop offset="100%" stop-color="#334155"/>
+    </linearGradient>
+    <radialGradient id="glass" cx="40%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#e0f2fe" stop-opacity="0.55"/>
+      <stop offset="70%" stop-color="#38bdf8" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#0369a1" stop-opacity="0.35"/>
+    </radialGradient>
+    <filter id="float" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+    <filter id="innerShadow">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.2" result="b"/>
+      <feOffset dx="0" dy="1" in="b" result="o"/>
+      <feComposite in="o" in2="SourceAlpha" operator="arithmetic" k2="-1" k3="1" result="s"/>
+      <feColorMatrix in="s" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.35 0"/>
+      <feBlend in2="SourceGraphic" mode="normal"/>
+    </filter>
+    <clipPath id="round">
+      <circle cx="256" cy="256" r="248"/>
+    </clipPath>
+  </defs>
+  <!-- Base disc (square canvas; circle is the icon) -->
+  <g clip-path="url(#round)" filter="url(#float)">
+    <circle cx="256" cy="256" r="248" fill="#070d14"/>
+    <circle cx="256" cy="256" r="244" fill="url(#sphere)"/>
+    <circle cx="256" cy="256" r="244" fill="url(#sphereShade)"/>
+    <!-- Specular highlight -->
+    <ellipse cx="188" cy="148" rx="108" ry="58" fill="#fff" opacity="0.1" transform="rotate(-24 188 148)"/>
+    <ellipse cx="168" cy="132" rx="42" ry="18" fill="#fff" opacity="0.14" transform="rotate(-24 168 132)"/>
+    <!-- Outer metal rim -->
+    <circle cx="256" cy="256" r="242" fill="none" stroke="url(#bezel)" stroke-width="11"/>
+    <circle cx="256" cy="256" r="236" fill="none" stroke="url(#bezelHi)" stroke-width="4" opacity="0.9"/>
+    <!-- Mustache: layered for depth -->
+    <g transform="translate(256, 278)">
+      <path
+        d="M-128,-4 C-95,-38 -35,-42 0,-22 C35,-42 95,-38 128,-4 C95,22 40,28 0,14 C-40,28 -95,22 -128,-4 Z"
+        fill="url(#stacheShadow)"
+        opacity="0.85"
+        transform="translate(0,3)"
+      />
+      <path
+        d="M-124,-6 C-92,-36 -34,-40 0,-20 C34,-40 92,-36 124,-6 C92,20 38,26 0,12 C-38,26 -92,20 -124,-6 Z"
+        fill="url(#stache)"
+        filter="url(#innerShadow)"
+      />
+      <path
+        d="M-85,-18 Q-42,-32 0,-22 Q42,-32 85,-18"
+        fill="none"
+        stroke="#fff"
+        stroke-opacity="0.2"
+        stroke-width="3"
+        stroke-linecap="round"
+      />
+    </g>
+    <!-- Monocle -->
+    <g transform="translate(312, 218)">
+      <path d="M0,-42 Q10,-52 22,-48" fill="none" stroke="url(#bezel)" stroke-width="4" stroke-linecap="round"/>
+      <circle r="40" fill="none" stroke="url(#bezel)" stroke-width="9"/>
+      <circle r="33" fill="url(#glass)"/>
+      <circle r="33" fill="none" stroke="#000" stroke-opacity="0.15" stroke-width="1"/>
+      <ellipse cx="-10" cy="-14" rx="16" ry="9" fill="#fff" opacity="0.45" transform="rotate(-38 -10 -14)"/>
+      <line x1="-6" y1="-38" x2="-6" y2="38" stroke="url(#bezel)" stroke-width="5" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

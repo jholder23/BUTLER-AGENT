@@ -1,0 +1,83 @@
+Butler text→video and image→video (ComfyUI)
+==========================================
+
+0) Stable Diffusion checkpoints (images / many workflows)
+   - Butler’s default on-disk layout is `<repo>/sd/ComfyUI/models/checkpoints/` (override with SD_PROJECT_PATH).
+   - From the repo root, after `pip install huggingface_hub`:
+     `py -3 scripts/download_comfy_checkpoint.py --preset sdxl-base`
+     or `--preset pony-xl`, or pass `--repo` / `--file` for any Hugging Face .safetensors.
+   - Windows shortcut: `scripts\download_default_sd_checkpoint.bat` (installs hf_hub if needed, then SDXL base).
+
+1. Default workflows (Wan 2.1 example graphs from Comfy-Org) ship with Butler:
+   knowledge/comfy_workflows/butler_txt2video.json
+   knowledge/comfy_workflows/butler_img2video.json
+   Butler loads these automatically if you do not place overrides under your SD project.
+
+   To override, put JSON in:
+   <SD_PROJECT_PATH>/ComfyUI/workflows/
+
+   Default basenames (no extension in config):
+   - butler_txt2video.json   — text to video
+   - butler_img2video.json        — image to video (generic)
+   - butler_img2video_nsfw.json   — image to video tuned for NSFW stills (default for Butler)
+
+   Install matching Wan UNET / VAE / CLIP / (for i2v) CLIP-Vision weights under ComfyUI’s model folders
+   as described in the Comfy-Org Wan 2.1 repack (Hugging Face). Butler remaps loader filenames to whatever
+   your Comfy /object_info lists.
+
+   Quick download (from repo root): download_wan_models.bat
+   Or: py -3 knowledge/download_wan_models.py --image2video --i2v-fp8
+   Add --image2video for i2v weights (large); --i2v-fp8 uses the smaller ~16 GB UNET (recommended).
+
+2. NSFW image→video
+   - Put an adult still in ComfyUI input (or generate via FaceID NSFW img2img first).
+   - Load sidebar workflow: butler_img2video_nsfw
+   - Edit MOTION PROMPT only (what moves) — the start frame carries identity / clothing / explicit content.
+   - Butler chat: ask to animate the last/uploaded image; uses img2video_workflow from comfy_config.json
+     (defaults to butler_img2video_nsfw).
+   - No Butler prompt censor on local Comfy; ReActor NSFW filter is separate (still image path).
+
+2. Export as API workflow
+   - In ComfyUI: use “Save (API format)” if your build has it, or export UI JSON and rely on Butler’s
+     converter (same as img2img), or convert with a workflow-to-API tool.
+
+3. Graph expectations
+   - Butler walks every KSampler / KSamplerAdvanced and sets prompts on linked CLIPTextEncode nodes (recursing
+     through WanImageToVideo-style conditioning). This matches Wan 2.2 graphs that use two samplers (high /
+     low noise) so both paths get your motion prompt.
+   - For checkpoints / models, the same resolution as img2img applies (see comfy_helper / object_info).
+   - Output: Butler looks for video files in history under types gifs, videos, images (.mp4, .webm, .gif, etc.).
+
+3b) Photoreal image→video (recommended upgrade from bundled Wan 2.1)
+   - Community and Comfy’s own guides converge on Wan 2.2 for stronger motion, lighting, and temporal
+     coherence than 2.1 — especially for “real camera” / photoreal stills you then animate.
+   - Workflow source: updated Comfy Desktop / ComfyUI → browse built-in video templates (Video → Wan 2.2),
+     or follow the official tutorial at https://docs.comfy.org/tutorials/video/wan/wan2_2
+   - Models: Wan 2.2 uses a mixture-of-experts setup (high-noise + refiner-style low-noise UNets) and
+     version-specific VAE filenames — install whatever your exported graph lists, then let Butler remap
+     via Comfy /object_info like the 2.1 downloader does.
+   - Point Butler at your export: save API JSON as e.g. butler_img2video_wan22.json under
+     <SD_PROJECT_PATH>/ComfyUI/workflows/ and set img2video_workflow to butler_img2video_wan22 in
+     Documents/Butlor/comfy_config.json or set COMFY_IMG2VIDEO_WORKFLOW=butler_img2video_wan22.
+   - NSFW: Butler does not filter prompts for local Comfy; you are responsible for lawful use and for
+     choosing checkpoints / Loras that match your intent.
+
+3c) Photoreal NSFW image→image (ComfyUI)
+   - Butler’s default img2img stack is already oriented to photoreal adult content when your local checkpoints
+     allow it: FaceID + IP-Adapter graphs (e.g. img2img_butler_faceid_explicit_ultimate_nsfw) for identity-locked
+     portraits, plus SDXL VAE and Juggernaut fallbacks — see knowledge/comfy_helper.py _DEFAULT_IMG2IMG_ORDER.
+   - For maximum still-frame realism outside the SDXL family, export a photoreal img2img API graph from Comfy
+     (e.g. FLUX-class or your preferred base) and add its basename first in img2img_workflow_order in
+     comfy_config.json.
+
+4. Overrides
+   - Environment: COMFY_TXT2VIDEO_WORKFLOW, COMFY_IMG2VIDEO_WORKFLOW (basename, optional .json stripped).
+   - Or Documents/Butlor/comfy_config.json keys: txt2video_workflow, img2video_workflow (string or list).
+
+5. Order of backends (sd_helper)
+   - SD_TXT2VIDEO_SCRIPT / SD_VIDEO_SCRIPT if set and file exists (runs first).
+   - Else Comfy workflows if the matching file exists.
+   - Else Forge/A1111 extension HTTP endpoints.
+   - BUTLER_SKIP_COMFY_VIDEO=1 skips the Comfy step.
+
+See README / .env.example for SD_PROJECT_PATH and Knowledge API URL.

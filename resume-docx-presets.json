@@ -1,0 +1,35 @@
+{
+  "defaultStyleId": "harvard",
+  "styles": [
+    {
+      "id": "harvard",
+      "name": "Classic",
+      "blurb": "Single-column, crisp section dividers. Best for traditional and ATS-friendly submissions.",
+      "preview": { "bg": "#fbfbf9", "accent": "#111827", "text": "#374151", "bar": "#9ca3af" }
+    },
+    {
+      "id": "modern",
+      "name": "Modern Sidebar",
+      "blurb": "Two-column with a dark right sidebar (skills/tools). Clean, modern, high contrast.",
+      "preview": { "bg": "#ffffff", "accent": "#2563eb", "text": "#111827", "bar": "#0b1220" }
+    },
+    {
+      "id": "executive",
+      "name": "Executive",
+      "blurb": "Top accent banner, spacious typography, elegant section rules for leadership roles.",
+      "preview": { "bg": "#ffffff", "accent": "#78350f", "text": "#1f2937", "bar": "#78350f" }
+    },
+    {
+      "id": "ats",
+      "name": "ATS Simple",
+      "blurb": "Arial, minimal styling—optimized for applicant tracking systems.",
+      "preview": { "bg": "#ffffff", "accent": "#000000", "text": "#1f2937", "bar": "#e5e7eb" }
+    },
+    {
+      "id": "corporate",
+      "name": "Corporate Sidebar",
+      "blurb": "Two-column with a slate left sidebar. Strong structure for enterprise/corporate roles.",
+      "preview": { "bg": "#ffffff", "accent": "#334155", "text": "#0f172a", "bar": "#334155" }
+    }
+  ]
+}

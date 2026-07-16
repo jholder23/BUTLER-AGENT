@@ -1,0 +1,337 @@
+{
+  "last_node_id": 41,
+  "last_link_id": 32,
+  "nodes": [
+    {
+      "id": 40,
+      "type": "ButlerEasyPrompt",
+      "pos": [40, 40],
+      "size": [620, 1100],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [
+        { "name": "positive", "type": "STRING", "links": [1], "slot_index": 0 },
+        { "name": "negative", "type": "STRING", "links": [2], "slot_index": 1 },
+        { "name": "cfg", "type": "FLOAT", "links": [22], "slot_index": 2 },
+        { "name": "steps", "type": "INT", "links": [21], "slot_index": 3 },
+        { "name": "faceid_weight", "type": "FLOAT", "links": [23], "slot_index": 4 },
+        { "name": "faceid_weight_v2", "type": "FLOAT", "links": [24], "slot_index": 5 },
+        { "name": "faceid_end_at", "type": "FLOAT", "links": [25], "slot_index": 6 },
+        { "name": "faceid_lora", "type": "FLOAT", "links": [26], "slot_index": 7 },
+        { "name": "width", "type": "INT", "links": [27], "slot_index": 8 },
+        { "name": "height", "type": "INT", "links": [28], "slot_index": 9 },
+        { "name": "settings_note", "type": "STRING", "links": [29], "slot_index": 10 },
+        { "name": "filename_prefix", "type": "STRING", "links": [30], "slot_index": 11 }
+      ],
+      "properties": { "Node name for S&R": "ButlerEasyPrompt" },
+      "widgets_values": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "single",
+        0,
+        "fixed",
+        "",
+        0.35,
+        "full_body",
+        true,
+        true,
+        true,
+        true,
+        "20_high_lora_face"
+      ],
+      "title": "PRESET last dropdown | sweep: SWEEP_SEED=increment + Comfy Batch count (keep EmptyLatent batch=1)",
+      "bgcolor": "#252",
+      "color": "#3f789e"
+    },
+    {
+      "id": 12,
+      "type": "LoadImage",
+      "pos": [40, 1180],
+      "size": [320, 314],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [3, 4], "shape": 3, "slot_index": 0 },
+        { "name": "MASK", "type": "MASK", "links": null, "shape": 3 }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["images.jpg", "image"],
+      "title": "FACE PHOTO — pick a clear frontal face",
+      "bgcolor": "#545"
+    },
+    {
+      "id": 9,
+      "type": "PreviewImage",
+      "pos": [1680, 120],
+      "size": [420, 420],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [{ "name": "images", "type": "IMAGE", "link": 20 }],
+      "properties": { "Node name for S&R": "PreviewImage" },
+      "title": "RESULT",
+      "bgcolor": "#252"
+    },
+    {
+      "id": 41,
+      "type": "ButlerSweepSave",
+      "pos": [1680, 560],
+      "size": [420, 120],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 31 },
+        { "name": "settings_note", "type": "STRING", "link": 29 },
+        { "name": "filename_prefix", "type": "STRING", "link": 30 }
+      ],
+      "properties": { "Node name for S&R": "ButlerSweepSave" },
+      "widgets_values": [],
+      "title": "SAVE + log → output/butler_easy_sweep_log.csv",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 4,
+      "type": "CheckpointLoaderSimple",
+      "pos": [640, 40],
+      "size": [300, 98],
+      "flags": { "collapsed": true },
+      "order": 2,
+      "mode": 0,
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [5], "slot_index": 0 },
+        { "name": "CLIP", "type": "CLIP", "links": [6, 7], "slot_index": 1 },
+        { "name": "VAE", "type": "VAE", "links": [8], "slot_index": 2 }
+      ],
+      "properties": { "Node name for S&R": "CheckpointLoaderSimple" },
+      "widgets_values": ["juggernautXL_ragnarok.safetensors"],
+      "title": "(auto) checkpoint"
+    },
+    {
+      "id": 23,
+      "type": "IPAdapterInsightFaceLoader",
+      "pos": [640, 160],
+      "size": [280, 82],
+      "flags": { "collapsed": true },
+      "order": 3,
+      "mode": 0,
+      "outputs": [{ "name": "INSIGHTFACE", "type": "INSIGHTFACE", "links": [9], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "IPAdapterInsightFaceLoader" },
+      "widgets_values": ["CPU", "buffalo_l"],
+      "title": "(auto) insightface"
+    },
+    {
+      "id": 20,
+      "type": "IPAdapterUnifiedLoaderFaceID",
+      "pos": [640, 260],
+      "size": [320, 126],
+      "flags": { "collapsed": true },
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 5 },
+        { "name": "ipadapter", "type": "IPADAPTER", "link": null },
+        { "name": "lora_strength", "type": "FLOAT", "link": 26, "widget": { "name": "lora_strength" } }
+      ],
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [10], "slot_index": 0 },
+        { "name": "ipadapter", "type": "IPADAPTER", "links": [11], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "IPAdapterUnifiedLoaderFaceID" },
+      "widgets_values": ["FACEID PORTRAIT UNNORM - SDXL only (strong)", 0.55, "CPU"],
+      "title": "(auto) FaceID loader — lora from Easy Prompt"
+    },
+    {
+      "id": 18,
+      "type": "IPAdapterFaceID",
+      "pos": [1000, 120],
+      "size": [320, 300],
+      "flags": { "collapsed": true },
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 10 },
+        { "name": "ipadapter", "type": "IPADAPTER", "link": 11 },
+        { "name": "image", "type": "IMAGE", "link": 3 },
+        { "name": "image_negative", "type": "IMAGE", "link": null },
+        { "name": "attn_mask", "type": "MASK", "link": null },
+        { "name": "clip_vision", "type": "CLIP_VISION", "link": null },
+        { "name": "insightface", "type": "INSIGHTFACE", "link": 9 },
+        { "name": "weight", "type": "FLOAT", "link": 23, "widget": { "name": "weight" } },
+        { "name": "weight_faceidv2", "type": "FLOAT", "link": 24, "widget": { "name": "weight_faceidv2" } },
+        { "name": "end_at", "type": "FLOAT", "link": 25, "widget": { "name": "end_at" } }
+      ],
+      "outputs": [{ "name": "MODEL", "type": "MODEL", "links": [12], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "IPAdapterFaceID" },
+      "widgets_values": [0.65, 1.15, "ease out", "concat", 0, 0.55, "K+mean(V) w/ C penalty"],
+      "title": "(auto) FaceID weights from Easy Prompt / sweep"
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncode",
+      "pos": [1000, 480],
+      "size": [320, 80],
+      "flags": { "collapsed": true },
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 6 },
+        { "name": "text", "type": "STRING", "link": 1, "widget": { "name": "text" } }
+      ],
+      "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [13], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "CLIPTextEncode" },
+      "widgets_values": [""],
+      "title": "(auto) positive"
+    },
+    {
+      "id": 7,
+      "type": "CLIPTextEncode",
+      "pos": [1000, 600],
+      "size": [320, 80],
+      "flags": { "collapsed": true },
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 7 },
+        { "name": "text", "type": "STRING", "link": 2, "widget": { "name": "text" } }
+      ],
+      "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [14], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "CLIPTextEncode" },
+      "widgets_values": [""],
+      "title": "(auto) negative"
+    },
+    {
+      "id": 24,
+      "type": "EmptyLatentImage",
+      "pos": [1360, 560],
+      "size": [280, 106],
+      "flags": { "collapsed": true },
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        { "name": "width", "type": "INT", "link": 27, "widget": { "name": "width" } },
+        { "name": "height", "type": "INT", "link": 28, "widget": { "name": "height" } }
+      ],
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [15], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "EmptyLatentImage" },
+      "widgets_values": [832, 1216, 1],
+      "title": "(auto) size — keep batch_size=1 (never 20; ONNX OOM)"
+    },
+    {
+      "id": 3,
+      "type": "KSampler",
+      "pos": [1360, 120],
+      "size": [300, 262],
+      "flags": { "collapsed": true },
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 12 },
+        { "name": "positive", "type": "CONDITIONING", "link": 13 },
+        { "name": "negative", "type": "CONDITIONING", "link": 14 },
+        { "name": "latent_image", "type": "LATENT", "link": 15 },
+        { "name": "steps", "type": "INT", "link": 21, "widget": { "name": "steps" } },
+        { "name": "cfg", "type": "FLOAT", "link": 22, "widget": { "name": "cfg" } }
+      ],
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [16], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "KSampler" },
+      "widgets_values": [0, "randomize", 45, 6.0, "dpmpp_2m_sde", "karras", 1],
+      "title": "(auto) sampler — cfg/steps from Easy Prompt"
+    },
+    {
+      "id": 8,
+      "type": "VAEDecode",
+      "pos": [1520, 420],
+      "size": [140, 46],
+      "flags": { "collapsed": true },
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        { "name": "samples", "type": "LATENT", "link": 16 },
+        { "name": "vae", "type": "VAE", "link": 8 }
+      ],
+      "outputs": [{ "name": "IMAGE", "type": "IMAGE", "links": [17], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "VAEDecode" },
+      "title": "(auto) decode"
+    },
+    {
+      "id": 27,
+      "type": "ReActorFaceSwap",
+      "pos": [1520, 480],
+      "size": [140, 80],
+      "flags": { "collapsed": true },
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        { "name": "input_image", "type": "IMAGE", "link": 17 },
+        { "name": "source_image", "type": "IMAGE", "link": 4 }
+      ],
+      "outputs": [{ "name": "SWAPPED_IMAGE", "type": "IMAGE", "links": [20, 31], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "ReActorFaceSwap" },
+      "widgets_values": [true, "inswapper_128.onnx", "retinaface_resnet50", "none", 1, 0.5, "no", "no", "0", "0", 1],
+      "title": "(auto) face paste"
+    }
+  ],
+  "links": [
+    [1, 40, 0, 6, 1, "STRING"],
+    [2, 40, 1, 7, 1, "STRING"],
+    [3, 12, 0, 18, 2, "IMAGE"],
+    [4, 12, 0, 27, 1, "IMAGE"],
+    [5, 4, 0, 20, 0, "MODEL"],
+    [6, 4, 1, 6, 0, "CLIP"],
+    [7, 4, 1, 7, 0, "CLIP"],
+    [8, 4, 2, 8, 1, "VAE"],
+    [9, 23, 0, 18, 6, "INSIGHTFACE"],
+    [10, 20, 0, 18, 0, "MODEL"],
+    [11, 20, 1, 18, 1, "IPADAPTER"],
+    [12, 18, 0, 3, 0, "MODEL"],
+    [13, 6, 0, 3, 1, "CONDITIONING"],
+    [14, 7, 0, 3, 2, "CONDITIONING"],
+    [15, 24, 0, 3, 3, "LATENT"],
+    [16, 3, 0, 8, 0, "LATENT"],
+    [17, 8, 0, 27, 0, "IMAGE"],
+    [20, 27, 0, 9, 0, "IMAGE"],
+    [21, 40, 3, 3, 4, "INT"],
+    [22, 40, 2, 3, 5, "FLOAT"],
+    [23, 40, 4, 18, 7, "FLOAT"],
+    [24, 40, 5, 18, 8, "FLOAT"],
+    [25, 40, 6, 18, 9, "FLOAT"],
+    [26, 40, 7, 20, 2, "FLOAT"],
+    [27, 40, 8, 24, 0, "INT"],
+    [28, 40, 9, 24, 1, "INT"],
+    [29, 40, 10, 41, 1, "STRING"],
+    [30, 40, 11, 41, 2, "STRING"],
+    [31, 27, 0, 41, 0, "IMAGE"]
+  ],
+  "groups": [
+    {
+      "title": "Fill prompts → pick PRESET (or sweep_winners) → Queue",
+      "bounding": [20, 20, 640, 1500],
+      "color": "#3f789e",
+      "font_size": 22
+    }
+  ],
+  "config": {},
+  "extra": {
+    "butler_workflow_meta": {
+      "name": "img2img_juggernaut_faceid_easy_nsfw",
+      "summary": "Easy FaceID img2img with winner presets + optional sweeps.",
+      "notes": [
+        "PRESET: 01_face_lock, 09_high_cfg, 18_cfg65_mid, 20_high_lora_face (winners) + custom + 20 total.",
+        "MODE=single + PRESET uses that combo. custom = Balance slider.",
+        "MODE=sweep_winners / sweep_20: set SWEEP_SEED to increment, then Comfy Extra options Batch count = 4 or 20 (SEQUENTIAL).",
+        "NEVER raise EmptyLatentImage batch_size above 1 — FaceID+ReActor ONNX bad allocation / OOM on 12GB at parallel batch 4–20.",
+        "Desktop Comfy must use --normalvram --fp16-vae (not --lowvram --disable-smart-memory) or Windows can AV at VAEDecode.",
+        "Butler rewrites VAEDecode → VAEDecodeTiled at queue time for safer peak VRAM.",
+        "Saves under output/easy_sweep/ + butler_easy_sweep_log.csv"
+      ]
+    }
+  },
+  "version": 0.4
+}

@@ -1,0 +1,398 @@
+{
+  "last_node_id": 18,
+  "last_link_id": 26,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "CheckpointLoaderSimple",
+      "pos": [40, 760],
+      "size": [315, 98],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [1], "slot_index": 0 },
+        { "name": "CLIP", "type": "CLIP", "links": [2, 3], "slot_index": 1 },
+        { "name": "VAE", "type": "VAE", "links": [5, 6], "slot_index": 2 }
+      ],
+      "properties": { "Node name for S&R": "CheckpointLoaderSimple" },
+      "widgets_values": ["juggernautXL_ragnarok.safetensors"],
+      "title": "Juggernaut XL — photoreal checkpoint"
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [40, 40],
+      "size": [315, 314],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [7, 8], "shape": 3, "slot_index": 0 },
+        { "name": "MASK", "type": "MASK", "links": null, "shape": 3 }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["face_reference.png", "image"],
+      "title": "FACE REFERENCE — clear frontal adult face",
+      "bgcolor": "#545"
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [400, 40],
+      "size": [315, 314],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [9], "shape": 3, "slot_index": 0 },
+        { "name": "MASK", "type": "MASK", "links": null, "shape": 3 }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["pose_reference.png", "image"],
+      "title": "POSE / ACTION REFERENCE — full body + visible hands",
+      "bgcolor": "#355"
+    },
+    {
+      "id": 4,
+      "type": "ImageScaleToTotalPixels",
+      "pos": [760, 40],
+      "size": [315, 126],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        { "name": "image", "type": "IMAGE", "link": 9 }
+      ],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [10], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "ImageScaleToTotalPixels" },
+      "widgets_values": ["lanczos", 1.0, 64],
+      "title": "Pose image → ~1 MP, preserve aspect ratio"
+    },
+    {
+      "id": 5,
+      "type": "DWPreprocessor",
+      "pos": [1120, 40],
+      "size": [315, 218],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        { "name": "image", "type": "IMAGE", "link": 10 }
+      ],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [12], "slot_index": 0 },
+        { "name": "POSE_KEYPOINT", "type": "POSE_KEYPOINT", "links": null, "slot_index": 1 }
+      ],
+      "properties": { "Node name for S&R": "DWPreprocessor" },
+      "widgets_values": ["enable", "enable", "disable", 1024, "yolox_l.onnx", "dw-ll_ucoco_384.onnx", "disable"],
+      "title": "DWPose — body + hands only (face from face ref)",
+      "bgcolor": "#355"
+    },
+    {
+      "id": 6,
+      "type": "ControlNetLoader",
+      "pos": [1120, 300],
+      "size": [315, 58],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "outputs": [
+        { "name": "CONTROL_NET", "type": "CONTROL_NET", "links": [13], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "ControlNetLoader" },
+      "widgets_values": ["control-lora-openposeXL2-rank256.safetensors"],
+      "title": "SDXL OpenPose Control-LoRA (VRAM-efficient)"
+    },
+    {
+      "id": 7,
+      "type": "CLIPTextEncode",
+      "pos": [400, 430],
+      "size": [640, 240],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 2 }
+      ],
+      "outputs": [
+        { "name": "CONDITIONING", "type": "CONDITIONING", "links": [14], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "CLIPTextEncode" },
+      "widgets_values": [
+        "(adult age 25+:1.4), (performing the exact action and body pose shown in the pose reference:1.55), anatomically faithful hand placement and limb positions, (same person as face reference:1.35), realistic explicit adult scene, natural body proportions, realistic skin pores and fine skin texture, physically plausible contact and weight, accurate hands, five fingers per hand, coherent anatomy, cinematic practical lighting, shallow depth of field, high-end full-frame camera, 85mm lens, RAW photograph, photorealistic, highly detailed, uncensored"
+      ],
+      "title": "POSITIVE — the only positive prompt (edit this)",
+      "bgcolor": "#252"
+    },
+    {
+      "id": 8,
+      "type": "CLIPTextEncode",
+      "pos": [400, 720],
+      "size": [640, 240],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 3 }
+      ],
+      "outputs": [
+        { "name": "CONDITIONING", "type": "CONDITIONING", "links": [15], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "CLIPTextEncode" },
+      "widgets_values": [
+        "child, minor, underage, young-looking, teen, wrong action, wrong pose, ignored pose reference, arms in wrong position, hands in wrong position, different face, identity drift, another person, wrong facial features, malformed hands, extra fingers, missing fingers, fused fingers, extra limbs, missing limbs, broken anatomy, dislocated joints, impossible contact, duplicate body, cropped body, out of frame, blurry face, lowres, worst quality, low quality, jpeg artifacts, oversmoothed skin, plastic skin, wax figure, doll, CGI, 3d render, anime, illustration, censor bar, mosaic, watermark, text, logo"
+      ],
+      "title": "NEGATIVE — the only negative prompt (edit this)",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 9,
+      "type": "ControlNetApplyAdvanced",
+      "pos": [1480, 260],
+      "size": [315, 218],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        { "name": "positive", "type": "CONDITIONING", "link": 14 },
+        { "name": "negative", "type": "CONDITIONING", "link": 15 },
+        { "name": "control_net", "type": "CONTROL_NET", "link": 13 },
+        { "name": "image", "type": "IMAGE", "link": 12 },
+        { "name": "vae", "type": "VAE", "link": 6 }
+      ],
+      "outputs": [
+        { "name": "positive", "type": "CONDITIONING", "links": [16], "slot_index": 0 },
+        { "name": "negative", "type": "CONDITIONING", "links": [17], "slot_index": 1 }
+      ],
+      "properties": { "Node name for S&R": "ControlNetApplyAdvanced" },
+      "widgets_values": [1.0, 0.0, 0.9],
+      "title": "Pose adherence — stronger for extreme folded poses"
+    },
+    {
+      "id": 10,
+      "type": "IPAdapterInsightFaceLoader",
+      "pos": [40, 390],
+      "size": [315, 82],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "outputs": [
+        { "name": "INSIGHTFACE", "type": "INSIGHTFACE", "links": [18], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "IPAdapterInsightFaceLoader" },
+      "widgets_values": ["CPU", "buffalo_l"],
+      "title": "InsightFace on CPU — saves VRAM"
+    },
+    {
+      "id": 11,
+      "type": "IPAdapterUnifiedLoaderFaceID",
+      "pos": [40, 510],
+      "size": [315, 126],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 1 },
+        { "name": "ipadapter", "type": "IPADAPTER", "link": null }
+      ],
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [19], "slot_index": 0 },
+        { "name": "ipadapter", "type": "IPADAPTER", "links": [20], "slot_index": 1 }
+      ],
+      "properties": { "Node name for S&R": "IPAdapterUnifiedLoaderFaceID" },
+      "widgets_values": ["FACEID PORTRAIT UNNORM - SDXL only (strong)", 0.35, "CPU"],
+      "title": "FaceID loader — lighter LoRA so pose can win"
+    },
+    {
+      "id": 12,
+      "type": "IPAdapterFaceID",
+      "pos": [1480, 520],
+      "size": [315, 298],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 19 },
+        { "name": "ipadapter", "type": "IPADAPTER", "link": 20 },
+        { "name": "image", "type": "IMAGE", "link": 7 },
+        { "name": "image_negative", "type": "IMAGE", "link": null },
+        { "name": "attn_mask", "type": "MASK", "link": null },
+        { "name": "clip_vision", "type": "CLIP_VISION", "link": null },
+        { "name": "insightface", "type": "INSIGHTFACE", "link": 18 }
+      ],
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [21], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "IPAdapterFaceID" },
+      "widgets_values": [0.55, 1.0, "ease out", "concat", 0.0, 0.45, "K+mean(V) w/ C penalty"],
+      "title": "FaceID until 45% — keep identity, stop fighting pose"
+    },
+    {
+      "id": 13,
+      "type": "EmptyLatentImage",
+      "pos": [1120, 520],
+      "size": [210, 58],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "outputs": [
+        { "name": "LATENT", "type": "LATENT", "links": [22], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "EmptyLatentImage" },
+      "widgets_values": [832, 1216, 1],
+      "title": "Fresh portrait latent — scene comes from prompt"
+    },
+    {
+      "id": 14,
+      "type": "KSampler",
+      "pos": [1840, 300],
+      "size": [315, 262],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 21 },
+        { "name": "positive", "type": "CONDITIONING", "link": 16 },
+        { "name": "negative", "type": "CONDITIONING", "link": 17 },
+        { "name": "latent_image", "type": "LATENT", "link": 22 }
+      ],
+      "outputs": [
+        { "name": "LATENT", "type": "LATENT", "links": [23], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "KSampler" },
+      "widgets_values": [0, "randomize", 42, 5.8, "dpmpp_2m_sde", "karras", 1.0],
+      "title": "Fresh scene generation — pose supplied by ControlNet"
+    },
+    {
+      "id": 15,
+      "type": "VAEDecode",
+      "pos": [2200, 340],
+      "size": [210, 46],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        { "name": "samples", "type": "LATENT", "link": 23 },
+        { "name": "vae", "type": "VAE", "link": 5 }
+      ],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [24], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "VAEDecode" }
+    },
+    {
+      "id": 16,
+      "type": "ReActorFaceSwap",
+      "pos": [2440, 260],
+      "size": [315, 358],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        { "name": "input_image", "type": "IMAGE", "link": 24 },
+        { "name": "source_image", "type": "IMAGE", "link": 8 }
+      ],
+      "outputs": [
+        { "name": "SWAPPED_IMAGE", "type": "IMAGE", "links": [25, 26], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "ReActorFaceSwap" },
+      "widgets_values": [true, "inswapper_128.onnx", "retinaface_resnet50", "none", 1, 0.5, "no", "no", "0", "0", 1],
+      "title": "Final ReActor pass — maximum face likeness"
+    },
+    {
+      "id": 17,
+      "type": "PreviewImage",
+      "pos": [2800, 220],
+      "size": [420, 420],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 25 }
+      ],
+      "properties": { "Node name for S&R": "PreviewImage" },
+      "title": "FINAL — action from pose, identity from face"
+    },
+    {
+      "id": 18,
+      "type": "SaveImage",
+      "pos": [2800, 680],
+      "size": [420, 100],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 26 }
+      ],
+      "properties": { "Node name for S&R": "SaveImage" },
+      "widgets_values": ["nsfw_realism_openpose_faceid"],
+      "title": "Save final image"
+    }
+  ],
+  "links": [
+    [1, 1, 0, 11, 0, "MODEL"],
+    [2, 1, 1, 7, 0, "CLIP"],
+    [3, 1, 1, 8, 0, "CLIP"],
+    [5, 1, 2, 15, 1, "VAE"],
+    [6, 1, 2, 9, 4, "VAE"],
+    [7, 2, 0, 12, 2, "IMAGE"],
+    [8, 2, 0, 16, 1, "IMAGE"],
+    [9, 3, 0, 4, 0, "IMAGE"],
+    [10, 4, 0, 5, 0, "IMAGE"],
+    [12, 5, 0, 9, 3, "IMAGE"],
+    [13, 6, 0, 9, 2, "CONTROL_NET"],
+    [14, 7, 0, 9, 0, "CONDITIONING"],
+    [15, 8, 0, 9, 1, "CONDITIONING"],
+    [16, 9, 0, 14, 1, "CONDITIONING"],
+    [17, 9, 1, 14, 2, "CONDITIONING"],
+    [18, 10, 0, 12, 6, "INSIGHTFACE"],
+    [19, 11, 0, 12, 0, "MODEL"],
+    [20, 11, 1, 12, 1, "IPADAPTER"],
+    [21, 12, 0, 14, 0, "MODEL"],
+    [22, 13, 0, 14, 3, "LATENT"],
+    [23, 14, 0, 15, 0, "LATENT"],
+    [24, 15, 0, 16, 0, "IMAGE"],
+    [25, 16, 0, 17, 0, "IMAGE"],
+    [26, 16, 0, 18, 0, "IMAGE"]
+  ],
+  "groups": [
+    {
+      "title": "1. REFERENCES — separate face and pose images",
+      "bounding": [20, 20, 710, 355],
+      "color": "#8b5d33",
+      "font_size": 22
+    },
+    {
+      "title": "2. ONLY TWO PROMPTS",
+      "bounding": [380, 400, 680, 580],
+      "color": "#3f789e",
+      "font_size": 22
+    },
+    {
+      "title": "3. POSE CONTROL + FACE IDENTITY",
+      "bounding": [1080, 20, 735, 820],
+      "color": "#456a4a",
+      "font_size": 22
+    }
+  ],
+  "config": {},
+  "extra": {
+    "butler_workflow_meta": {
+      "name": "img2img_juggernaut_faceid_openpose_action_nsfw",
+      "summary": "NSFW-realism img2img with one positive, one negative, separate OpenPose action reference, FaceID, and ReActor.",
+      "notes": [
+        "FACE REFERENCE drives FaceID and final ReActor identity.",
+        "POSE / ACTION REFERENCE is resized to ~1 MP and extracted with DWPose body+hands only; pose-face landmarks stay disabled to avoid conflicts on occluded or rear-angle poses.",
+        "A fresh latent prevents the pose image background from anchoring the requested scene.",
+        "OpenPose Control-LoRA defaults to strength 1.0 through 90%; Butler can adjust both values.",
+        "FaceID now fades out by 45% so it establishes identity without overpowering extreme body geometry; ReActor restores the face after decode.",
+        "Exactly one CLIPTextEncode positive and one CLIPTextEncode negative.",
+        "Requires control-lora-openposeXL2-rank256.safetensors under ComfyUI/models/controlnet."
+      ]
+    }
+  },
+  "version": 0.4
+}

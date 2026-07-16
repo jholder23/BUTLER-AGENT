@@ -1,0 +1,427 @@
+{
+  "last_node_id": 54,
+  "last_link_id": 110,
+  "nodes": [
+    {
+      "id": 40,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 40],
+      "size": [420, 120],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [80], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "PrimitiveStringMultiline" },
+      "widgets_values": ["(both index fingers inserted deep into ear canals:1.85), (fingertips pressing firmly into ears:1.75), (hands cupping sides of head:1.55), elbows raised to shoulder height, upper arms horizontal, fingers clearly visible performing the action, anatomically correct hands, five fingers per hand"],
+      "title": "(ACTION) — HIGH PRIORITY gestures",
+      "bgcolor": "#553"
+    },
+    {
+      "id": 46,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 190],
+      "size": [420, 120],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [100], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "PrimitiveStringMultiline" },
+      "widgets_values": ["(same woman as reference photo:1.55), (identical face to face reference:1.6), matching facial features, same eyes nose mouth jawline, same age, consistent identity, recognizable likeness"],
+      "title": "(LIKENESS) — force face match to FACE REF",
+      "bgcolor": "#545"
+    },
+    {
+      "id": 41,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 340],
+      "size": [420, 100],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [81], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "PrimitiveStringMultiline" },
+      "widgets_values": ["(standing:1.25), frontal view, facing camera, shoulders relaxed, symmetrical posture"],
+      "title": "(POSE) — body only, no hands",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 42,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 470],
+      "size": [420, 100],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [83], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "PrimitiveStringMultiline" },
+      "widgets_values": ["wearing (black lace lingerie set:1.3), bra and panties, realistic lace texture, natural fabric folds"],
+      "title": "(OUTFIT)",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 43,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 600],
+      "size": [420, 90],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [85], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "PrimitiveStringMultiline" },
+      "widgets_values": ["(dim bedroom at night:1.1), warm lamp light, soft shadows"],
+      "title": "(SCENE)",
+      "bgcolor": "#363"
+    },
+    {
+      "id": 44,
+      "type": "PrimitiveStringMultiline",
+      "pos": [40, 720],
+      "size": [420, 90],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [87], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "PrimitiveStringMultiline" },
+      "widgets_values": ["(full body shot:1.25), head to toe, feet visible, photorealistic, RAW photo, sharp focus"],
+      "title": "(FRAMING)",
+      "bgcolor": "#373"
+    },
+    {
+      "id": 50,
+      "type": "StringConcatenate",
+      "pos": [500, 80],
+      "size": [280, 120],
+      "flags": { "collapsed": true },
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        { "name": "string_a", "type": "STRING", "link": 80, "widget": { "name": "string_a" } },
+        { "name": "string_b", "type": "STRING", "link": 100, "widget": { "name": "string_b" } },
+        { "name": "delimiter", "type": "STRING", "link": null, "widget": { "name": "delimiter" } }
+      ],
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [101], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "StringConcatenate" },
+      "widgets_values": ["", "", ", "],
+      "title": "ACTION + LIKENESS"
+    },
+    {
+      "id": 51,
+      "type": "StringConcatenate",
+      "pos": [500, 220],
+      "size": [280, 120],
+      "flags": { "collapsed": true },
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        { "name": "string_a", "type": "STRING", "link": 101, "widget": { "name": "string_a" } },
+        { "name": "string_b", "type": "STRING", "link": 81, "widget": { "name": "string_b" } },
+        { "name": "delimiter", "type": "STRING", "link": null, "widget": { "name": "delimiter" } }
+      ],
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [82], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "StringConcatenate" },
+      "widgets_values": ["", "", ", "],
+      "title": "+ POSE"
+    },
+    {
+      "id": 52,
+      "type": "StringConcatenate",
+      "pos": [500, 360],
+      "size": [280, 120],
+      "flags": { "collapsed": true },
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        { "name": "string_a", "type": "STRING", "link": 82, "widget": { "name": "string_a" } },
+        { "name": "string_b", "type": "STRING", "link": 83, "widget": { "name": "string_b" } },
+        { "name": "delimiter", "type": "STRING", "link": null, "widget": { "name": "delimiter" } }
+      ],
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [84], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "StringConcatenate" },
+      "widgets_values": ["", "", ", "],
+      "title": "+ OUTFIT"
+    },
+    {
+      "id": 53,
+      "type": "StringConcatenate",
+      "pos": [500, 500],
+      "size": [280, 120],
+      "flags": { "collapsed": true },
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        { "name": "string_a", "type": "STRING", "link": 84, "widget": { "name": "string_a" } },
+        { "name": "string_b", "type": "STRING", "link": 85, "widget": { "name": "string_b" } },
+        { "name": "delimiter", "type": "STRING", "link": null, "widget": { "name": "delimiter" } }
+      ],
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [86], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "StringConcatenate" },
+      "widgets_values": ["", "", ", "],
+      "title": "+ SCENE"
+    },
+    {
+      "id": 54,
+      "type": "StringConcatenate",
+      "pos": [500, 640],
+      "size": [280, 120],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        { "name": "string_a", "type": "STRING", "link": 86, "widget": { "name": "string_a" } },
+        { "name": "string_b", "type": "STRING", "link": 87, "widget": { "name": "string_b" } },
+        { "name": "delimiter", "type": "STRING", "link": null, "widget": { "name": "delimiter" } }
+      ],
+      "outputs": [{ "name": "STRING", "type": "STRING", "links": [88], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "StringConcatenate" },
+      "widgets_values": ["", "", ", "],
+      "title": "+ FRAMING → MAIN"
+    },
+    {
+      "id": 4,
+      "type": "CheckpointLoaderSimple",
+      "pos": [860, 760],
+      "size": { "0": 315, "1": 98 },
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [110], "slot_index": 0 },
+        { "name": "CLIP", "type": "CLIP", "links": [3, 5], "slot_index": 1 },
+        { "name": "VAE", "type": "VAE", "links": [8], "slot_index": 2 }
+      ],
+      "properties": { "Node name for S&R": "CheckpointLoaderSimple" },
+      "widgets_values": ["juggernautXL_ragnarok.safetensors"]
+    },
+    {
+      "id": 23,
+      "type": "IPAdapterInsightFaceLoader",
+      "pos": [860, -40],
+      "size": [315, 82],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "outputs": [{ "name": "INSIGHTFACE", "type": "INSIGHTFACE", "links": [107], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "IPAdapterInsightFaceLoader" },
+      "widgets_values": ["CPU", "buffalo_l"]
+    },
+    {
+      "id": 20,
+      "type": "IPAdapterUnifiedLoaderFaceID",
+      "pos": [860, 70],
+      "size": [315, 126],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 110 },
+        { "name": "ipadapter", "type": "IPADAPTER", "link": null }
+      ],
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [105], "slot_index": 0 },
+        { "name": "ipadapter", "type": "IPADAPTER", "links": [106], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "IPAdapterUnifiedLoaderFaceID" },
+      "widgets_values": ["FACEID PORTRAIT UNNORM - SDXL only (strong)", 0.5, "CPU"],
+      "title": "FaceID loader — light (keeps pose free)"
+    },
+    {
+      "id": 18,
+      "type": "IPAdapterFaceID",
+      "pos": [1220, 40],
+      "size": [315, 298],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 105 },
+        { "name": "ipadapter", "type": "IPADAPTER", "link": 106 },
+        { "name": "image", "type": "IMAGE", "link": 108 },
+        { "name": "image_negative", "type": "IMAGE", "link": null },
+        { "name": "attn_mask", "type": "MASK", "link": null },
+        { "name": "clip_vision", "type": "CLIP_VISION", "link": null },
+        { "name": "insightface", "type": "INSIGHTFACE", "link": 107 }
+      ],
+      "outputs": [{ "name": "MODEL", "type": "MODEL", "links": [60], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "IPAdapterFaceID" },
+      "widgets_values": [0.55, 1.05, "ease out", "concat", 0, 0.55, "K+mean(V) w/ C penalty"],
+      "title": "Light FaceID — likeness hint, ReActor finishes match"
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncode",
+      "pos": [860, 560],
+      "size": [420, 140],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 3 },
+        { "name": "text", "type": "STRING", "link": 88, "widget": { "name": "text" } }
+      ],
+      "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [64], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "CLIPTextEncode" },
+      "widgets_values": [""],
+      "title": "MAIN positive — ACTION + LIKENESS first",
+      "bgcolor": "#252"
+    },
+    {
+      "id": 7,
+      "type": "CLIPTextEncode",
+      "pos": [860, 920],
+      "size": [420, 150],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [{ "name": "clip", "type": "CLIP", "link": 5 }],
+      "outputs": [{ "name": "CONDITIONING", "type": "CONDITIONING", "links": [65], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "CLIPTextEncode" },
+      "widgets_values": [
+        "different face, wrong face, another person, celebrity lookalike, mismatched identity, hands at sides, arms down, fingers not in ears, hands away from head, wrong action, wrong pose, bad hands, extra fingers, missing fingers, close-up, cropped, cut off legs, generic clothes, bad anatomy, blurry, low quality, cartoon, 3d render"
+      ],
+      "title": "NEGATIVE — wrong face + wrong action",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 24,
+      "type": "EmptyLatentImage",
+      "pos": [1340, 920],
+      "size": [315, 106],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [2], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "EmptyLatentImage" },
+      "widgets_values": [832, 1216, 1],
+      "title": "832×1216 (896×1152 for finger-heavy shots)"
+    },
+    {
+      "id": 3,
+      "type": "KSampler",
+      "pos": [1340, 560],
+      "size": { "0": 315, "1": 262 },
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 60 },
+        { "name": "positive", "type": "CONDITIONING", "link": 64 },
+        { "name": "negative", "type": "CONDITIONING", "link": 65 },
+        { "name": "latent_image", "type": "LATENT", "link": 2 }
+      ],
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [7], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "KSampler" },
+      "widgets_values": [0, "randomize", 55, 9.5, "dpmpp_2m_sde", "karras", 1],
+      "title": "CFG 9.5 — stronger action + likeness adherence"
+    },
+    {
+      "id": 8,
+      "type": "VAEDecode",
+      "pos": [1700, 560],
+      "size": { "0": 140, "1": 46 },
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        { "name": "samples", "type": "LATENT", "link": 7 },
+        { "name": "vae", "type": "VAE", "link": 8 }
+      ],
+      "outputs": [{ "name": "IMAGE", "type": "IMAGE", "links": [54], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "VAEDecode" }
+    },
+    {
+      "id": 12,
+      "type": "LoadImage",
+      "pos": [480, -160],
+      "size": { "0": 315, "1": 314 },
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [55, 108], "shape": 3, "slot_index": 0 },
+        { "name": "MASK", "type": "MASK", "links": null, "shape": 3 }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["images.jpg", "image"],
+      "title": "FACE REF — FaceID + ReActor (tight frontal face)"
+    },
+    {
+      "id": 27,
+      "type": "ReActorFaceSwap",
+      "pos": [1900, 540],
+      "size": [315, 358],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [
+        { "name": "input_image", "type": "IMAGE", "link": 54 },
+        { "name": "source_image", "type": "IMAGE", "link": 55 }
+      ],
+      "outputs": [{ "name": "SWAPPED_IMAGE", "type": "IMAGE", "links": [56], "slot_index": 0 }],
+      "properties": { "Node name for S&R": "ReActorFaceSwap" },
+      "widgets_values": [true, "inswapper_128.onnx", "retinaface_resnet50", "none", 1, 0.5, "no", "no", "0", "0", 1],
+      "title": "Final face paste for pixel-accurate likeness"
+    },
+    {
+      "id": 9,
+      "type": "PreviewImage",
+      "pos": [2260, 540],
+      "size": { "0": 400, "1": 400 },
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [{ "name": "images", "type": "IMAGE", "link": 56 }],
+      "properties": { "Node name for S&R": "PreviewImage" },
+      "title": "Final preview (temp)"
+    }
+  ],
+  "links": [
+    [2, 24, 0, 3, 3, "LATENT"],
+    [3, 4, 1, 6, 0, "CLIP"],
+    [5, 4, 1, 7, 0, "CLIP"],
+    [7, 3, 0, 8, 0, "LATENT"],
+    [8, 4, 2, 8, 1, "VAE"],
+    [54, 8, 0, 27, 0, "IMAGE"],
+    [55, 12, 0, 27, 1, "IMAGE"],
+    [56, 27, 0, 9, 0, "IMAGE"],
+    [60, 18, 0, 3, 0, "MODEL"],
+    [64, 6, 0, 3, 1, "CONDITIONING"],
+    [65, 7, 0, 3, 2, "CONDITIONING"],
+    [80, 40, 0, 50, 0, "STRING"],
+    [81, 41, 0, 51, 1, "STRING"],
+    [82, 51, 0, 52, 0, "STRING"],
+    [83, 42, 0, 52, 1, "STRING"],
+    [84, 52, 0, 53, 0, "STRING"],
+    [85, 43, 0, 53, 1, "STRING"],
+    [86, 53, 0, 54, 0, "STRING"],
+    [87, 44, 0, 54, 1, "STRING"],
+    [88, 54, 0, 6, 1, "STRING"],
+    [100, 46, 0, 50, 1, "STRING"],
+    [101, 50, 0, 51, 0, "STRING"],
+    [105, 20, 0, 18, 0, "MODEL"],
+    [106, 20, 1, 18, 1, "IPADAPTER"],
+    [107, 23, 0, 18, 6, "INSIGHTFACE"],
+    [108, 12, 0, 18, 2, "IMAGE"],
+    [110, 4, 0, 20, 0, "MODEL"]
+  ],
+  "groups": [
+    {
+      "title": "Prompt: ACTION → LIKENESS → POSE → OUTFIT → SCENE → FRAMING",
+      "bounding": [20, 20, 780, 820],
+      "color": "#3f789e",
+      "font_size": 22
+    }
+  ],
+  "config": {},
+  "extra": {
+    "butler_workflow_meta": {
+      "name": "img2img_juggernaut_faceid_new_scene_nsfw",
+      "summary": "Advanced: ACTION+LIKENESS prompts first; light FaceID + ReActor. Manual weighted boxes.",
+      "notes": [
+        "Restored advanced builder (not Easy). For simple blank boxes use img2img_juggernaut_faceid_easy_nsfw.",
+        "ACTION merges first with high weights. LIKENESS + light FaceID + ReActor for identity.",
+        "No pose reference / OpenPose."
+      ]
+    }
+  },
+  "version": 0.4
+}

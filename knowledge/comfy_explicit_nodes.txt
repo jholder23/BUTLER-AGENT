@@ -1,0 +1,25 @@
+ComfyUI custom nodes — explicit / photoreal SDXL (local, uncensored checkpoints)
+
+There is no official “NSFW-only” extension. Community workflows combine uncensored SDXL
+checkpoints with identity and regional refinement nodes.
+
+Bundled Butler workflows reference these repos:
+
+1) ComfyUI_IPAdapter_plus (cubiq)
+   - IPAdapter, IPAdapter FaceID, unified loaders.
+   - Pair with models from scripts/install_faceid_stack.py (CLIP ViT-H, portrait.sdxl.unnorm.bin).
+
+2) ComfyUI-Impact-Pack (ltdrdata)
+   - FaceDetailer, SEGS, masks, regional sampling, iterative upscale.
+   - README requires ComfyUI 0.3.63+ for recent versions; pip install -r requirements.txt inside Comfy’s venv.
+
+3) ComfyUI-Impact-Subpack (ltdrdata)
+   - UltralyticsDetectorProvider for YOLO bbox models used by FaceDetailer (e.g. face_yolov8m.pt in bbox/).
+
+4) Optional: ComfyUI-Manager (ltdrdata)
+   - Install/update nodes from the UI.
+
+Installer: scripts/install_comfy_explicit_nodes.py (and .bat).
+FaceID weights helper: scripts/install_faceid_stack.py.
+
+After install: restart ComfyUI. Use Comfy’s python_embeded\python.exe for pip on Windows portable builds.

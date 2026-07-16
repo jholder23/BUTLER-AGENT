@@ -1,0 +1,48 @@
+{
+  "name": "butler",
+  "version": "0.1.1",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js \"Describe what you want to build\"",
+    "ui:server": "node ui-server.js",
+    "dev": "node scripts/dev-entry.mjs",
+    "dev:restart": "node scripts/free-butler-dev-ports.mjs && node scripts/dev-entry.mjs -- --force",
+    "dev:smoke-chat": "node scripts/dev-stack-chat-smoke.mjs",
+    "free:dev-ports": "node scripts/free-butler-dev-ports.mjs",
+    "dev:code-helper": "node scripts/dev-code-helper.mjs",
+    "dev:knowledge": "node scripts/ensure-knowledge-deps.mjs && node scripts/run-knowledge-dev.mjs",
+    "dev:ui-server": "wait-on tcp:127.0.0.1:8765 && node scripts/run-dev-ui-server.mjs",
+    "dev:vite": "wait-on tcp:127.0.0.1:8765 tcp:127.0.0.1:4001 && npm run dev:vite --prefix ui",
+    "dev:electron": "node scripts/dev-entry.mjs --electron",
+    "build:installer": "cd ui && npm run installer",
+    "installer": "cd ui && npm run installer",
+    "release": "node scripts/release-butler.mjs",
+    "desktop": "node scripts/release-butler.mjs",
+    "dist": "node scripts/release-butler.mjs",
+    "rebuild-butler": "cd ui && npm run build:app",
+    "test:knowledge": "node scripts/ensure-knowledge-deps.mjs && cd knowledge && python -m pytest tests -v --tb=short",
+    "test:ui": "cd ui && npm run test",
+    "test:resume-pdf": "node scripts/test-resume-pdf.mjs",
+    "dev:api": "node ui-server.js",
+    "test:all": "npm run test:knowledge && npm run test:ui"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "kill-port": "^2.0.1",
+    "nodemon": "^3.1.9",
+    "wait-on": "^8.0.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "docx": "^9.6.1",
+    "dotenv": "^10.0.0",
+    "express": "^4.21.2",
+    "openai": "^4.104.0",
+    "pdfkit": "^0.18.0",
+    "three": "^0.183.2",
+    "undici": "^7.25.0"
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "appId": "com.you.codehelper.agent",
+  "productName": "Butler Agent",
+  "directories": {
+    "output": "dist-app-agent"
+  },
+  "files": [
+    "dist/**",
+    "electron/**",
+    "../ui-server.js",
+    "../butlor-data-root.mjs",
+    "../resumePdfKit.mjs",
+    "../resume-pdf-presets.json",
+    "../resumeDocxKit.mjs",
+    "../resume-docx-presets.json",
+    "../sd-fill-from-disk.mjs",
+    "../network-monitor.mjs",
+    "../.env"
+  ],
+  "extraFiles": [
+    {
+      "from": "scripts/Butler-Rebuild-To-Desktop.bat",
+      "to": "."
+    },
+    {
+      "from": "scripts/Butler-Agent-Start.cmd",
+      "to": "."
+    }
+  ],
+  "extraResources": [
+    {
+      "from": "../desktop-rb-helper.cjs",
+      "to": "desktop-rb-helper.cjs"
+    },
+    {
+      "from": "../print3d-openscad.mjs",
+      "to": "print3d-openscad.mjs"
+    },
+    {
+      "from": "../knowledge",
+      "to": "knowledge",
+      "filter": [
+        "**/*",
+        "!knowledge_db",
+        "!knowledge_db/**/*",
+        "!**/__pycache__",
+        "!**/__pycache__/**/*",
+        "!**/*.pyc",
+        "!tests",
+        "!tests/**/*",
+        "!.pytest_cache",
+        "!.pytest_cache/**/*"
+      ]
+    },
+    {
+      "from": "python-embed",
+      "to": "python-embed"
+    },
+    {
+      "from": "../.env",
+      "to": ".env"
+    }
+  ],
+  "win": {
+    "target": [
+      "dir",
+      "nsis"
+    ],
+    "icon": "electron/icon.ico",
+    "signAndEditExecutable": false
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": false,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Butler Agent",
+    "include": "electron/installer.nsh",
+    "installerIcon": "electron/icon.ico",
+    "uninstallerIcon": "electron/icon.ico"
+  }
+}

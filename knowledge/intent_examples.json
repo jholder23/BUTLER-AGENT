@@ -1,0 +1,57 @@
+{
+  "_comment": "Add your own examples here. Butler learns from these—no preset commands. Format: user says X in plain English, model returns the matching JSON.",
+  "examples": [
+    {
+      "user": "apply to 10 jobs for intermediate full-stack developer, fully remote",
+      "response": {"mode": "jobs_auto_apply", "role": "intermediate full-stack developer", "location": "remote", "max_jobs": 10, "auto_submit": false, "reply": "Finding and preparing materials for 10 intermediate full-stack developer jobs (remote)."}
+    },
+    {
+      "user": "apply and submit to 10 jobs for intermediate full stack developer full remote in US",
+      "response": {"mode": "jobs_auto_apply", "role": "intermediate full stack developer", "location": "remote US", "max_jobs": 10, "auto_submit": true, "reply": "I'll find and apply to 10 intermediate full stack developer jobs (remote US) and submit the applications for you."}
+    },
+    {
+      "user": "find me 5 software engineer jobs in Austin",
+      "response": {"mode": "jobs_auto_apply", "description": "software engineer Austin", "max_jobs": 5, "auto_submit": false, "reply": "Searching for 5 software engineer jobs in Austin."}
+    },
+    {
+      "user": "find listings for intermediate full-stack dev at startups, remote",
+      "response": {"mode": "jobs_auto_apply", "description": "intermediate full-stack developer at startup, remote", "max_jobs": 5, "auto_submit": false, "reply": "Finding job listings matching your description."}
+    },
+    {
+      "user": "I need to apply for remote frontend roles",
+      "response": {"mode": "jobs_auto_apply", "role": "frontend developer", "location": "remote", "max_jobs": 10, "auto_submit": false, "reply": "I'll find frontend developer jobs that are remote."}
+    },
+    {
+      "user": "go make money, find me some gigs",
+      "response": {"mode": "gigs_run", "skills": "frontend development, transcription", "max_gigs": 5, "reply": "Finding freelance gigs for you."}
+    },
+    {
+      "user": "run gigs for python and data analysis",
+      "response": {"mode": "gigs_run", "skills": "python, data analysis", "max_gigs": 5, "reply": "Searching for gigs in Python and data analysis."}
+    },
+    {
+      "user": "create a 3d model of an iphone 6 case",
+      "response": {"mode": "print3d", "description": "create a 3d model of an iphone 6 case", "reply": "I'll generate OpenSCAD for a printable iPhone 6 case."}
+    },
+    {
+      "user": "I need an STL for a simple phone holder",
+      "response": {"mode": "print3d", "description": "simple phone holder for FDM print", "reply": "Routing to 3D print (OpenSCAD/STL)."}
+    },
+    {
+      "user": "could I 3D print molds for concrete and break the plastic off after it sets",
+      "response": {"mode": "chat", "reply": "Yes—many people print single-use or low-temp molds in PLA/PETG; use release agent, draft angles, and expect wear; I’m answering in chat because you asked whether it’s feasible, not for an STL file."}
+    },
+    {
+      "user": "could I print molds in PLA for concrete fingerboard obstacles",
+      "response": {"mode": "chat", "reply": "PLA is common for prototype concrete molds; use mold release, reasonable wall thickness, and gentle demolding—chat answer, not print3d unless you want me to generate a mesh."}
+    },
+    {
+      "user": "generate a chill lofi drum loop for a music sample",
+      "response": {"mode": "sound_musicgen", "prompt": "chill lofi drum loop, mellow, short sample", "reply": "Routing to free local MusicGen."}
+    },
+    {
+      "user": "generate a short audio sample, dark synth bass",
+      "response": {"mode": "sound_musicgen", "prompt": "short audio sample, dark synth bass", "reply": "Routing to MusicGen (not SD)."}
+    }
+  ]
+}

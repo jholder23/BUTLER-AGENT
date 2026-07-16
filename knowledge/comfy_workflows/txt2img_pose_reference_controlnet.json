@@ -1,0 +1,84 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "juggernautXL_ragnarok.safetensors"
+    }
+  },
+  "2": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "butler_pose_openpose_map.png"
+    }
+  },
+  "3": {
+    "class_type": "ControlNetLoader",
+    "inputs": {
+      "control_net_name": "control-lora-openposeXL2-rank256.safetensors"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "(one living adult human person:1.55), (match the OpenPose body pose exactly:1.55), (photorealistic:1.4), (realistic photograph:1.3), clean realistic reference photo of a simple clothed adult person, natural human proportions, mannequin-neutral plain clothing, NOT anime, NOT manga, NOT illustration, NOT cartoon, (eye-level camera:1.45), (camera level with the ground:1.4), (head-on frontal view:1.35), clear face, natural skin, wearing a plain t-shirt and pants, clear human proportions, visible arms legs hands feet, full body head to toe in frame, distinct separated limbs, plain solid light gray studio background",
+      "clip": ["1", 1]
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "anime, manga, cartoon, comic, chibi, illustration, illustrated, 2d animation, cel shading, anime style, drawn, sketch, painting, stylized art, waifu, pixiv, lineart, comic book, cartoonish, toon, skeleton, bones, skull, ribcage, anatomical chart, x-ray, stick figure, wireframe, OpenPose overlay, silhouette, black silhouette, abstract shape, blob, featureless body, shadow figure, statue, mannequin, doll, robot, jewelry, ornament, wrong pose, ignored pose, different pose, flat on back with legs extended, straight legs when knees should be bent, melted feet, fused feet, arms in wrong position, hands in wrong position, legs in wrong position, multiple people, crowd, busy background, scenery, furniture, props, clutter, cropped body, out of frame, cut off head, cut off feet, hidden hands, hidden feet, missing limbs, extra limbs, fused limbs, overlapping limbs, text, watermark, logo, nude, nsfw, photoreal fashion, high angle when eye-level requested, bird's eye, top-down when not requested",
+      "clip": ["1", 1]
+    }
+  },
+  "6": {
+    "class_type": "ControlNetApplyAdvanced",
+    "inputs": {
+      "positive": ["4", 0],
+      "negative": ["5", 0],
+      "control_net": ["3", 0],
+      "image": ["2", 0],
+      "vae": ["1", 2],
+      "strength": 0.95,
+      "start_percent": 0.0,
+      "end_percent": 0.92
+    }
+  },
+  "7": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 768,
+      "height": 1152,
+      "batch_size": 1
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 0,
+      "steps": 28,
+      "cfg": 6.5,
+      "sampler_name": "dpmpp_2m_sde",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["1", 0],
+      "positive": ["6", 0],
+      "negative": ["6", 1],
+      "latent_image": ["7", 0]
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["8", 0],
+      "vae": ["1", 2]
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "txt2img_pose_reference_controlnet",
+      "images": ["9", 0]
+    }
+  }
+}

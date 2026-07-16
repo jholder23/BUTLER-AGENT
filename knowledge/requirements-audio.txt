@@ -1,0 +1,10 @@
+# Optional: free local text→music (MusicGen via Hugging Face Transformers).
+#   pip install -r knowledge/requirements-audio.txt
+#
+# Uses facebook/musicgen-small (or BUTLER_MUSICGEN_MODEL). Works on Python 3.13+ with
+# current PyTorch wheels. (audiocraft is not used — it pins torch==2.1.0, which has no cp313 builds.)
+#
+# First run downloads model weights. GPU recommended; CPU works but is slow.
+torch>=2.6.0
+transformers>=4.41.0
+accelerate>=0.27.0

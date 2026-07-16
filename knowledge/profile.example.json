@@ -1,0 +1,12 @@
+{
+  "name": "Your Full Name",
+  "email": "you@example.com",
+  "phone": "",
+  "address": "Street, City, Province/State",
+  "base_resume": "Paste your full resume here. Butler will tailor it for each job.",
+  "user_context": "Brief summary about you for cover letters: e.g. '5 years software engineering, Python/React, looking for remote roles.'",
+  "indeed_use_chrome_profile": true,
+  "chrome_profile_path": "",
+  "indeed_email": "",
+  "indeed_password": ""
+}

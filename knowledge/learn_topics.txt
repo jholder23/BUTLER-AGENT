@@ -1,0 +1,11 @@
+# One topic per line (optional). Butler merges this with built-in seed topics for Settings → Go learn.
+# Lines starting with # are ignored.
+
+Rust programming language overview
+TypeScript best practices for large apps
+Home network security basics
+Cooking science and food safety
+Renewable energy technologies
+Psychology of habit formation
+Climate patterns and meteorology basics
+Small business bookkeeping introduction

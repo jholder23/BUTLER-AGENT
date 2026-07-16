@@ -1,0 +1,14 @@
+diff --git a/node_modules/react-quill/lib/index.js b/node_modules/react-quill/lib/index.js
+index b77e914..4d61bb0 100644
+--- a/node_modules/react-quill/lib/index.js
++++ b/node_modules/react-quill/lib/index.js
+@@ -320,7 +320,8 @@ var ReactQuill = /** @class */ (function (_super) {
+         if (!this.editingArea) {
+             throw new Error('Instantiating on missing editing area');
+         }
+-        var element = react_dom_1.default.findDOMNode(this.editingArea);
++        var raw = this.editingArea;
++        var element = raw && typeof raw === 'object' && raw.nodeType === 1 ? raw : react_dom_1.default.findDOMNode(this.editingArea);
+         if (!element) {
+             throw new Error('Cannot find element for editing area');
+         }

@@ -1,0 +1,70 @@
+.env
+agent-env.json
+*.local
+node_modules/
+**/node_modules/
+dist/
+dist-app-new/
+dist-desktop/
+ui/dist/
+ui/dist-app-new/
+ui/python-embed/
+__pycache__/
+*.pyc
+.Python
+*.log
+_resume-smoke*.pdf
+.DS_Store
+Thumbs.db
+cookies.txt
+.firebase/
+
+# Local Stable Diffusion tree (junction or copy); not part of source
+/sd/
+
+# Snapshot from D:\Chat - PEEPEEDEE (large local Chroma DB)
+legacy/chat-peepeedee/knowledge_db/
+
+# Auto-generated few-shot file (compacted from butler_training.jsonl)
+knowledge/auto_intent_examples.json
+knowledge/auto_intent_examples.json.tmp
+
+.butler-desktop-build.log
+
+# --- Agent / packaging ignores (keep source, exclude bulky runtimes) ---
+App/
+ui/dist-app/
+ui/dist-butler-new-install/
+ui/tmp/
+ui/*.wav
+**/python-embed/
+
+# Local runtime / user data
+episodes/
+exports/
+application-timer-log/
+installer/
+knowledge/_api_err.txt
+knowledge/_api_out.txt
+reply.txt
+file.txt
+
+# IDE (optional local)
+.cursor/
+.vscode/
+
+# Knowledge DB runtime dumps (regenerable; can be large)
+knowledge/knowledge_db/
+**/knowledge_db/
+
+# Secrets / oauth
+credentials.json
+**/token.json
+**/client_secret*.json
+.env.*
+!.env.example
+
+
+tools/ffmpeg/
+ui/installers/*.exe
+
