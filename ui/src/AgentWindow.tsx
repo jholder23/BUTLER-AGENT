@@ -4,22 +4,42 @@ import { AgentSettingsPanel } from './components/AgentSettingsPanel';
 import { AgentSidebar } from './components/AgentSidebar';
 import { AgentBottomPanel, type AgentFooterTab, type TerminalEntry } from './components/AgentBottomPanel';
 import { AgentMcpPanel } from './components/AgentMcpPanel';
+import { AgentSpotifyPanel } from './components/AgentSpotifyPanel';
+import { AgentTodoPanel } from './components/AgentTodoPanel';
 import { AgentUtilityPanel, useAgentSecretChord } from './components/AgentUtilityPanel';
+import { VoiceConversationStage } from './components/VoiceConversationStage';
+import {
+  loadChatFormality,
+  loadPulseColors,
+  type PulseColors,
+} from './lib/chatModePrefs';
 import {
   AgentFileDiffModal,
   AgentFileDiffStrip,
+  SelfEditReviewBanner,
   collectAgentFileChanges,
   type AgentFileChange,
 } from './components/AgentFileDiff';
 import {
+  acceptSelfEditReview,
+  AGENT_CWD_BEFORE_SELF_EDIT_KEY,
+  AGENT_SESSION_ID,
   browseAgentWorkspace,
+  BUTLER_SOURCE_WORKSPACE_WARNING,
   createAgentCheckpoint,
   defaultAgentProjectRoot,
+  defaultButlerSourceRoot,
   fetchAgentTerminalInfo,
+  fetchAgentTerminalShells,
+  fetchSelfEditReview,
+  fetchSelfEditReviewChanges,
   listAgentCheckpoints,
+  listSelfEditReviews,
+  looksLikeButlerSourceRoot,
   looksLikeIncompleteAgentReply,
   openAgentWorkspaceInExplorer,
   persistAgentProjectRoot,
+  rejectSelfEditReview,
   resetAgentTerminal,
   runAgentTerminalCommand,
   revertAgentCheckpoint,
@@ -27,15 +47,24 @@ import {
   sendAgentTurn,
   unwrapAgentReply,
 } from './lib/agentApi';
+import type { AgentShellInfo } from './lib/agentTypes';
 import {
   agentThreadFingerprint,
   agentThreadHasContent,
   deleteSavedAgentThread,
+  isAgentWelcomeMessage,
   listSavedAgentThreads,
   renameSavedAgentThread,
   saveAgentThread,
   type SavedAgentThread,
 } from './lib/agentThreads';
+import {
+  listAgentWorkspacePaths,
+  loadExpandedWorkspaceKeys,
+  persistExpandedWorkspaceKeys,
+  rememberAgentWorkspace,
+  workspaceExpandKey,
+} from './lib/agentWorkspaces';
 import {
   AGENT_PROVIDERS,
   loadAgentApiKeys,
@@ -58,50 +87,261 @@ import {
   type AgentEnvVarRow,
 } from './lib/agentEnvVars';
 import { loadAgentTheme, persistAgentTheme, type AgentThemePrefs } from './lib/agentTheme';
+import {
+  looksLikeOpenBrowserAsk,
+  openAgentBrowserPopout,
+  OPEN_BROWSER_CHAT_REPLY,
+} from './lib/openBrowserChat';
 import { startPcmRecording, transcribePcmViaButler } from './lib/speechToText';
+import { cancelNeuralSpeech, isNeuralSpeaking, speakNeural } from './lib/neuralTts';
+import { startVoiceModePcmAutoListen } from './voiceModeAutoListen';
+import { SilentScreenCapture, type ScreenCaptureFrame } from './lib/screenAssistCapture';
+import {
+  getScreenLookModeEnabled,
+  setScreenLookModeEnabled,
+  subscribeScreenAssistPrefs,
+} from './lib/screenAssistPrefs';
 import type {
   AgentChatMessage,
   AgentCheckpoint,
   AgentRunStatus,
   AgentTodo,
   AgentToolStep,
+  SelfEditReview,
 } from './lib/agentTypes';
-
+const SCREEN_LOOK_INTERVAL_MS = 6500;
 const AGENT_SIDEBAR_WIDTH_KEY = 'butler-agent-sidebar-width';
 const AGENT_SIDEBAR_OPEN_KEY = 'butler-agent-sidebar-open';
 const AGENT_FOOTER_OPEN_KEY = 'butler-agent-footer-open';
 const AGENT_FOOTER_TAB_KEY = 'butler-agent-footer-tab';
 const AGENT_FOOTER_HEIGHT_KEY = 'butler-agent-footer-height';
-const AGENT_BROWSER_MAXIMIZED_KEY = 'butler-agent-browser-maximized';
 const AGENT_SIDEBAR_MIN_PX = 220;
 const AGENT_SIDEBAR_MAX_PX = 440;
 const AGENT_FOOTER_MIN_PX = 160;
 const AGENT_FOOTER_MAX_PX = 720;
 const AGENT_FOOTER_DEFAULT_PX = 360;
-const AGENT_FOOTER_BROWSER_DEFAULT_PX = 420;
 const AGENT_CHAT_STICK_PX = 80;
 
 const AGENT_PRODUCT_MODE_KEY = 'butler-agent-product-mode';
+/** Settings: pre-check "Override tests" on self-edit reviews when tests are missing. */
+const AGENT_SELF_EDIT_ACCEPT_WITHOUT_TESTS_KEY = 'butler-self-edit-accept-without-tests';
 
-type AgentProductMode = 'chat' | 'code';
+type AgentProductMode = 'chat' | 'code' | 'self-edit';
+
+/** Keep the latest review at the top of the durable Reviews sidebar list. */
+function reviewListKey(review: SelfEditReview | null | undefined): string {
+  if (!review) return '';
+  return (
+    String(review.review_id || '').trim() ||
+    String(review.session_id || '').trim() ||
+    String(review.checkpoint_id || '').trim() ||
+    String(review.run_id || '').trim()
+  );
+}
+
+function upsertPendingReview(reviews: SelfEditReview[], review: SelfEditReview): SelfEditReview[] {
+  const key = reviewListKey(review);
+  const rest = key
+    ? reviews.filter((r) => reviewListKey(r) !== key)
+    : reviews.filter((r) => r !== review);
+  return [review, ...rest];
+}
+
+function isCodingProductMode(mode: AgentProductMode): boolean {
+  return mode === 'code' || mode === 'self-edit';
+}
+
+/** Voice/self-edit: user is asking Butler to change his own product code. */
+function looksLikeSelfEditAsk(text: string): boolean {
+  const t = (text || '').trim().toLowerCase();
+  if (!t || t.length < 4) return false;
+  if (/\bself[- ]?edit\b/.test(t)) return true;
+  if (
+    /\b(edit|fix|change|patch|update|modify|refactor)\b[\s\S]{0,48}\b(yourself|your (own )?(code|source|ui|agent|repo)|butler)\b/.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (/\b(butler('s)? (own )?(code|source|repo|agent|ui|checkout))\b/.test(t)) return true;
+  if (/\b(agentwindow|butler_agent|agent_llm|allow_self_edit)\b/.test(t)) return true;
+  return false;
+}
+
+/**
+ * Narrow phatic/smalltalk only — safe for casual /api/chat while Self-edit or Code is on.
+ * Everything else in those modes uses the coding agent (default).
+ */
+function looksLikePurePhatic(text: string): boolean {
+  const t = (text || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?…]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t || t.length > 72) return false;
+  if (looksLikeCodingTask(t) || looksLikeSelfEditAsk(t)) return false;
+  if (
+    /\b(fix|change|edit|update|add|remove|build|make|implement|refactor|debug|write|create|patch|modify|bug|error|file|code|button|ui|mode|tab|setting|workspace|self[- ]?edit)\b/.test(
+      t,
+    )
+  ) {
+    return false;
+  }
+  return (
+    /^(hi|hey|hello|yo|sup|howdy)( there| butler)?$/.test(t) ||
+    /^(thanks|thank you|thx|ty)( (so )?much)?$/.test(t) ||
+    /^(ok|okay|cool|nice|great|awesome|got it|sounds good|alright|sure|yep|yeah|yup|nope|nah)$/.test(
+      t,
+    ) ||
+    /^(good (morning|afternoon|evening|night)|how are you|how's it going|whats? up|what'?s up)$/.test(
+      t,
+    ) ||
+    /^(bye|goodbye|see you|later)$/.test(t) ||
+    /^(lol|haha|lmao|heh)$/.test(t)
+  );
+}
+
+/** Voice/chat → Code-agent handoff: user wants repo/file edits, not small talk. */
+function looksLikeCodingTask(text: string): boolean {
+  const t = (text || '').trim().toLowerCase();
+  if (!t || t.length < 4) return false;
+
+  // Stay in Butler chat for image/job tools and pure Q&A.
+  if (
+    /\b(txt2img|img2img|comfy(?:ui)?|stable diffusion)\b/.test(t) ||
+    /\b(generate|draw|paint|render)\b[\s\S]{0,48}\b(image|picture|photo|video|anime)\b/.test(t) ||
+    /\b(job application|apply to jobs|cover letter|upwork|\bgigs?\b)\b/.test(t)
+  ) {
+    return false;
+  }
+  const qaOnly =
+    /\b(what(?:'s|s| is)|who is|explain|how does|why does|tell me about|define)\b/.test(t) &&
+    !/\b(fix|implement|write|refactor|add|change|edit|build|create|debug|scaffold)\b/.test(t);
+  if (qaOnly) return false;
+
+  const action =
+    /\b(fix|implement|refactor|debug|scaffold|patch|migrate|wire(?:\s+up)?|hook(?:\s+up)?)\b/.test(
+      t,
+    ) ||
+    /\b(write|add|create|build|make|update|change|edit|rename|delete|remove|install)\b/.test(t);
+  const target =
+    /\b(code|file|function|component|module|class|bug|error|test|api|endpoint|script|repo|project|app|website|site|ui|feature|button|css|html|tsx?|jsx?|typescript|javascript|python|react|hook)\b/.test(
+      t,
+    ) ||
+    /\bmy (code|project|repo|app|site|website)\b/.test(t) ||
+    /\bin (the|this|my) (code|project|repo|file|folder|directory)\b/.test(t);
+
+  if (action && target) return true;
+
+  return (
+    /\bfix (this|the|my|that|a |an )\b/.test(t) ||
+    /\bfix (a |an |the )?(bug|error|issue|crash)\b/.test(t) ||
+    /\b(write (some |the )?code|code (this|that|it)|implement (this|that|it))\b/.test(t) ||
+    /\b(refactor|pull request|unit test|typecheck|type-check|\blint\b)\b/.test(t)
+  );
+}
+
+function formatTodosChecklistSpeech(todos: AgentTodo[]): string {
+  const items = todos
+    .map((t) => String(t.content || '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!items.length) return '';
+  if (items.length === 1) return `Here's the plan: ${items[0]}.`;
+  const body = items.map((c, i) => `${i + 1}. ${c}`).join('. ');
+  return `Here's the plan: ${body}.`;
+}
 
 function readProductMode(): AgentProductMode {
   try {
     const v = localStorage.getItem(AGENT_PRODUCT_MODE_KEY);
-    if (v === 'chat' || v === 'code') return v;
+    if (v === 'chat' || v === 'code' || v === 'self-edit') return v;
   } catch {
     /* ignore */
   }
   return 'code';
 }
 
-const WELCOME_MESSAGE: AgentChatMessage = {
-  id: 'welcome',
-  role: 'assistant',
-  content:
-    'Butler **Agent** — switch **Chat** (conversation) or **Code** (tools) above. Same thread either way.',
-  source: 'Butler',
-};
+function readAcceptWithoutTestsPref(): boolean {
+  try {
+    return localStorage.getItem(AGENT_SELF_EDIT_ACCEPT_WITHOUT_TESTS_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeAcceptWithoutTestsPref(on: boolean): void {
+  try {
+    localStorage.setItem(AGENT_SELF_EDIT_ACCEPT_WITHOUT_TESTS_KEY, on ? '1' : '0');
+  } catch {
+    /* ignore */
+  }
+}
+
+type ChatAttach = { dataUrl: string; name: string; mime: string };
+
+function parseComposerDataUrl(dataUrl: string): { mime: string; base64: string } | null {
+  const s = dataUrl.trim();
+  const marker = ';base64,';
+  const i = s.indexOf(marker);
+  if (!s.toLowerCase().startsWith('data:') || i < 5) return null;
+  const mime = s.slice(5, i).trim() || 'application/octet-stream';
+  const base64 = s.slice(i + marker.length).replace(/\s/g, '');
+  if (!base64) return null;
+  return { mime, base64 };
+}
+
+async function compressComposerImage(dataUrl: string, maxSide = 1280, q = 0.82): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const w0 = img.naturalWidth || img.width;
+        const h0 = img.naturalHeight || img.height;
+        const scale = Math.min(1, maxSide / Math.max(w0, h0, 1));
+        const w = Math.max(1, Math.round(w0 * scale));
+        const h = Math.max(1, Math.round(h0 * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(dataUrl);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', q));
+      } catch {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+async function fileToChatAttach(file: File): Promise<ChatAttach | null> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ''));
+    r.onerror = () => reject(r.error || new Error('read failed'));
+    r.readAsDataURL(file);
+  });
+  if (!dataUrl) return null;
+  let mime =
+    parseComposerDataUrl(dataUrl)?.mime.split(';')[0].trim() || file.type || 'application/octet-stream';
+  let outUrl = dataUrl;
+  if (mime.toLowerCase().startsWith('image/')) {
+    outUrl = await compressComposerImage(dataUrl);
+    mime = 'image/jpeg';
+  }
+  return { dataUrl: outUrl, name: file.name || 'attachment', mime };
+}
+
+function screenFrameToAttach(frame: ScreenCaptureFrame): ChatAttach {
+  return { dataUrl: frame.dataUrl, name: frame.name || 'live-screen.jpg', mime: frame.mime || 'image/jpeg' };
+}
 
 function formatStepTitle(step: AgentToolStep): string {
   if (step.activity) return step.activity;
@@ -328,9 +568,9 @@ function readStoredFooterTab(): AgentFooterTab {
   if (typeof window === 'undefined') return 'terminal';
   try {
     const raw = localStorage.getItem(AGENT_FOOTER_TAB_KEY);
-    if (raw === 'terminal' || raw === 'browser' || raw === 'output') return raw;
+    if (raw === 'terminal' || raw === 'output') return raw;
     // Legacy tabs collapsed into Settings
-    if (raw === 'workspace' || raw === 'llm' || raw === 'checkpoints') return 'terminal';
+    if (raw === 'workspace' || raw === 'llm' || raw === 'checkpoints' || raw === 'browser') return 'terminal';
   } catch {
     /* ignore */
   }
@@ -346,6 +586,21 @@ type AgentWindowProps = {
   onExitSplit?: () => void;
   onPopOut?: () => void;
   onPopIn?: () => void;
+  /** App-owned voice conversation (mic + TTS). */
+  voiceMode?: boolean;
+  /** Pulse / glow when listening or speaking. */
+  voiceAlive?: boolean;
+  voiceToggleBusy?: boolean;
+  onToggleVoiceMode?: () => void;
+  /** App-owned mic mute (waveform toggles this while voice mode is on). */
+  micMuted?: boolean;
+  onToggleMicMute?: () => void;
+  /** Register sink so App continuous STT feeds Agent Chat instead of the hidden main chat. */
+  onRegisterVoiceSink?: (sink: ((text: string) => void) | null) => void;
+  /** Speak Butler chat replies aloud while voice mode is on. */
+  onSpeakReply?: (text: string) => void;
+  /** Tell App to pause STT while Agent is sending. */
+  onVoiceBusyChange?: (busy: boolean) => void;
 };
 
 export function AgentWindow({
@@ -357,10 +612,21 @@ export function AgentWindow({
   onExitSplit,
   onPopOut,
   onPopIn,
+  voiceMode = false,
+  voiceAlive = false,
+  voiceToggleBusy = false,
+  onToggleVoiceMode,
+  micMuted = false,
+  onToggleMicMute,
+  onRegisterVoiceSink,
+  onSpeakReply,
+  onVoiceBusyChange,
 }: AgentWindowProps = {}) {
+  /** When App owns voice (embedded), use props; otherwise AgentWindow runs its own loop (standalone). */
+  const voiceOwnedByApp = typeof onToggleVoiceMode === 'function';
   const rootRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLElement>(null);
-  const [messages, setMessages] = useState<AgentChatMessage[]>([WELCOME_MESSAGE]);
+  const [messages, setMessages] = useState<AgentChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [cwd, setCwd] = useState(defaultAgentProjectRoot);
   const [sending, setSending] = useState(false);
@@ -370,10 +636,23 @@ export function AgentWindow({
   const [scanSummary, setScanSummary] = useState<string | null>(null);
   const [checkpoints, setCheckpoints] = useState<AgentCheckpoint[]>([]);
   const [checkpointBusy, setCheckpointBusy] = useState(false);
+  const [selfEditReview, setSelfEditReview] = useState<SelfEditReview | null>(null);
+  const [selfEditReviewBusy, setSelfEditReviewBusy] = useState(false);
+  const [acceptWithoutTests, setAcceptWithoutTests] = useState(() => readAcceptWithoutTestsPref());
+  const [pendingReviews, setPendingReviews] = useState<SelfEditReview[]>([]);
+  const [reviewPanelOpen, setReviewPanelOpen] = useState(false);
+  const [reviewFileChanges, setReviewFileChanges] = useState<AgentFileChange[]>([]);
   const [savedThreads, setSavedThreads] = useState<SavedAgentThread[]>(() => listSavedAgentThreads());
   const [loadedThreadId, setLoadedThreadId] = useState<string | null>(null);
+  const [workspaceListTick, setWorkspaceListTick] = useState(0);
+  const [expandedWorkspaces, setExpandedWorkspaces] = useState<Set<string>>(() => {
+    const keys = loadExpandedWorkspaceKeys();
+    if (keys.length > 0) return new Set(keys);
+    // Expand active cwd on first visit.
+    return new Set([workspaceExpandKey(defaultAgentProjectRoot())]);
+  });
   const [savedFingerprint, setSavedFingerprint] = useState(() =>
-    agentThreadFingerprint([WELCOME_MESSAGE], defaultAgentProjectRoot()),
+    agentThreadFingerprint([], defaultAgentProjectRoot(), 'code'),
   );
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const [editingTitleValue, setEditingTitleValue] = useState('');
@@ -382,8 +661,11 @@ export function AgentWindow({
   const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => loadAgentApiKeys());
   const [envVarRows, setEnvVarRows] = useState<AgentEnvVarRow[]>(() => rowsFromRecord(loadAgentEnvVars()));
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pulseColors, setPulseColors] = useState<PulseColors>(() => loadPulseColors());
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [spotifyOpen, setSpotifyOpen] = useState(false);
   const [utilityOpen, setUtilityOpen] = useState(false);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
   const [productMode, setProductMode] = useState<AgentProductMode>(() => readProductMode());
   const [chatSessionId] = useState(
     () => `butler-chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -399,19 +681,28 @@ export function AgentWindow({
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => readStoredAgentBool(AGENT_SIDEBAR_OPEN_KEY, true));
   const [footerOpen, setFooterOpen] = useState<boolean>(() => readStoredAgentBool(AGENT_FOOTER_OPEN_KEY, false));
   const [footerTab, setFooterTab] = useState<AgentFooterTab>(() => readStoredFooterTab());
-  const [browserMaximized, setBrowserMaximized] = useState<boolean>(() =>
-    readStoredAgentBool(AGENT_BROWSER_MAXIMIZED_KEY, false),
-  );
   const [footerHeightPx, setFooterHeightPx] = useState<number>(() => {
     const stored = readStoredAgentSize(AGENT_FOOTER_HEIGHT_KEY, AGENT_FOOTER_MIN_PX, AGENT_FOOTER_MAX_PX);
-    if (stored != null) return stored;
-    return readStoredFooterTab() === 'browser' ? AGENT_FOOTER_BROWSER_DEFAULT_PX : AGENT_FOOTER_DEFAULT_PX;
+    return stored ?? AGENT_FOOTER_DEFAULT_PX;
   });
   const [terminalCommand, setTerminalCommand] = useState('');
   const [terminalBusy, setTerminalBusy] = useState(false);
   const [terminalEntries, setTerminalEntries] = useState<TerminalEntry[]>([]);
   const [terminalSessionCwd, setTerminalSessionCwd] = useState(() => defaultAgentProjectRoot());
-  const [terminalShellLabel, setTerminalShellLabel] = useState('pwsh');
+  const [terminalShellId, setTerminalShellId] = useState(() => {
+    try {
+      const stored = localStorage.getItem('butler_agent_terminal_shell');
+      if (stored === 'pwsh' || stored === 'powershell' || stored === 'cmd' || stored === 'bash') {
+        return stored;
+      }
+    } catch {
+      /* ignore */
+    }
+    return 'pwsh';
+  });
+  const [terminalShellLabel, setTerminalShellLabel] = useState('PowerShell');
+  const [terminalShells, setTerminalShells] = useState<AgentShellInfo[]>([]);
+  const agentShellSeenRef = useRef<Set<string>>(new Set());
   const [activeDiff, setActiveDiff] = useState<AgentFileChange | null>(null);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [cancelRequested, setCancelRequested] = useState(false);
@@ -428,10 +719,52 @@ export function AgentWindow({
   } | null>(null);
   const [speechState, setSpeechState] = useState<'idle' | 'listening' | 'transcribing'>('idle');
   const [speechError, setSpeechError] = useState<string | null>(null);
+  const [localVoiceMode, setLocalVoiceMode] = useState(false);
+  const [localVoiceBusy, setLocalVoiceBusy] = useState(false);
+  const [localSpeaking, setLocalSpeaking] = useState(false);
+  const [localUserSpeaking, setLocalUserSpeaking] = useState(false);
+  const [localMicMuted, setLocalMicMuted] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const [chatAttachment, setChatAttachment] = useState<{
+    dataUrl: string;
+    name: string;
+    mime: string;
+  } | null>(null);
+  const [composerDragOver, setComposerDragOver] = useState(false);
+  const chatFileInputRef = useRef<HTMLInputElement>(null);
+  const [screenSharing, setScreenSharing] = useState(false);
+  const [screenShareBusy, setScreenShareBusy] = useState(false);
+  const [screenShareError, setScreenShareError] = useState<string | null>(null);
+  const [screenLookMode, setScreenLookMode] = useState(() => getScreenLookModeEnabled());
+  const screenCaptureRef = useRef<SilentScreenCapture | null>(null);
+  const screenLookInFlightRef = useRef(false);
+  const localVoicePauseRef = useRef(false);
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const localSpeakingRef = useRef(false);
+  const sendingRef = useRef(false);
+  const effectiveVoiceMode = voiceOwnedByApp ? voiceMode : localVoiceMode;
+  const effectiveMicMuted = voiceOwnedByApp ? !!micMuted : localMicMuted;
+  const effectiveVoiceAlive = voiceOwnedByApp
+    ? voiceAlive && !effectiveMicMuted
+    : !effectiveMicMuted && (localSpeaking || localUserSpeaking || micLevel > 0.08);
+  const effectiveVoiceToggleBusy = voiceOwnedByApp ? voiceToggleBusy : localVoiceBusy;
+  const effectiveVoiceModeRef = useRef(effectiveVoiceMode);
+  effectiveVoiceModeRef.current = effectiveVoiceMode;
+  const speakReplyRef = useRef<(text: string) => void>(() => {});
+  const submitFromVoiceRef = useRef<(text: string) => void>(() => {});
+  const waveBarHeights = useMemo(() => {
+    if (effectiveMicMuted) return ['4px', '4px', '4px', '4px', '4px'];
+    const L = Math.max(0, Math.min(1, micLevel));
+    // Symmetric Copilot-style bars that grow with mic energy.
+    const mid = 6 + L * 14;
+    const near = 5 + L * 10;
+    const edge = 4 + L * 6;
+    return [edge, near, mid, near, edge].map((h) => `${Math.round(h)}px`);
+  }, [micLevel, effectiveMicMuted]);
 
   const currentFingerprint = useMemo(
-    () => agentThreadFingerprint(messages, cwd),
-    [messages, cwd],
+    () => agentThreadFingerprint(messages, cwd, productMode),
+    [messages, cwd, productMode],
   );
   const isDirty = currentFingerprint !== savedFingerprint;
 
@@ -441,7 +774,7 @@ export function AgentWindow({
   }, [agentProvider, cascadeEnabled]);
 
   const showContinue = useMemo(() => {
-    if (productMode !== 'code' || sending) return false;
+    if (!isCodingProductMode(productMode) || sending) return false;
     const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.id !== 'welcome');
     if (!last || last.error) return false;
     if (last.needsContinue) return true;
@@ -484,11 +817,26 @@ export function AgentWindow({
     setEnvVarRows(rows);
     const record = recordFromRows(rows);
     persistAgentEnvVars(record);
+    // Immediate sync so Allow self-edit / API keys hit the host without waiting
+    // for the settings debounce (Knowledge reads agent-env.json each write).
+    void syncAgentEnvVarsToHost(record);
   }, []);
 
   const refreshSavedThreads = useCallback(() => {
     setSavedThreads(listSavedAgentThreads());
   }, []);
+
+  const refreshWorkspaceList = useCallback(() => {
+    setWorkspaceListTick((n) => n + 1);
+  }, []);
+
+  const sidebarWorkspaces = useMemo(() => {
+    void workspaceListTick;
+    return listAgentWorkspacePaths({
+      currentCwd: cwd,
+      threadCwds: savedThreads.map((t) => t.cwd).filter(Boolean),
+    });
+  }, [cwd, savedThreads, workspaceListTick]);
 
   const refreshCheckpoints = useCallback(async () => {
     try {
@@ -499,18 +847,84 @@ export function AgentWindow({
     }
   }, []);
 
+  const refreshSelfEditReview = useCallback(async (opts?: {
+    prefer?: SelfEditReview | null;
+  }): Promise<number> => {
+    try {
+      const [one, list] = await Promise.all([fetchSelfEditReview(), listSelfEditReviews()]);
+      let reviews = list.reviews || [];
+      if (opts?.prefer) {
+        reviews = upsertPendingReview(reviews, opts.prefer);
+      }
+      setPendingReviews(reviews);
+      if (one.pending && one.review) {
+        setSelfEditReview(one.review);
+        return reviews.length;
+      }
+      if (opts?.prefer) {
+        setSelfEditReview(opts.prefer);
+        return reviews.length;
+      }
+      if (reviews.length > 0) {
+        const match =
+          reviews.find((r) => (r.session_id || '') === AGENT_SESSION_ID) || reviews[0];
+        setSelfEditReview(match);
+      } else {
+        setSelfEditReview(null);
+        setReviewFileChanges([]);
+      }
+      return reviews.length;
+    } catch {
+      if (opts?.prefer) {
+        setSelfEditReview(opts.prefer);
+        setPendingReviews((prev) => upsertPendingReview(prev, opts.prefer!));
+        return 1;
+      }
+      return 0;
+    }
+  }, []);
+
+  const loadReviewChanges = useCallback(async (review: SelfEditReview | null) => {
+    if (!review) {
+      setReviewFileChanges([]);
+      return;
+    }
+    try {
+      const out = await fetchSelfEditReviewChanges({
+        sessionId: review.session_id || undefined,
+      });
+      setReviewFileChanges(Array.isArray(out.changes) ? out.changes : []);
+    } catch {
+      setReviewFileChanges([]);
+    }
+  }, []);
+
+  const handleSelectReview = useCallback(
+    (review: SelfEditReview) => {
+      setSelfEditReview(review);
+      setReviewPanelOpen(true);
+      void loadReviewChanges(review);
+    },
+    [loadReviewChanges],
+  );
+
   useEffect(() => {
     if (!embedded) document.documentElement.classList.add('butler-agent-root');
     void refreshCheckpoints();
+    void refreshSelfEditReview();
+    const retry = window.setTimeout(() => {
+      void refreshSelfEditReview();
+    }, 2500);
     void (async () => {
       const vars = await fetchAgentEnvVarsFromHost();
       setEnvVarRows(rowsFromRecord(vars));
       await syncAgentEnvVarsToHost(vars);
     })();
     return () => {
+      window.clearTimeout(retry);
       if (!embedded) document.documentElement.classList.remove('butler-agent-root');
     };
-  }, [embedded, refreshCheckpoints]);
+  }, [embedded, refreshCheckpoints, refreshSelfEditReview]);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -566,11 +980,10 @@ export function AgentWindow({
       localStorage.setItem(AGENT_SIDEBAR_OPEN_KEY, sidebarOpen ? '1' : '0');
       localStorage.setItem(AGENT_FOOTER_OPEN_KEY, footerOpen ? '1' : '0');
       localStorage.setItem(AGENT_FOOTER_TAB_KEY, footerTab);
-      localStorage.setItem(AGENT_BROWSER_MAXIMIZED_KEY, browserMaximized ? '1' : '0');
     } catch {
       /* ignore */
     }
-  }, [sidebarOpen, footerOpen, footerTab, browserMaximized]);
+  }, [sidebarOpen, footerOpen, footerTab]);
 
   useEffect(() => {
     persistAgentTheme(theme);
@@ -590,11 +1003,23 @@ export function AgentWindow({
   }, []);
 
   const applyWorkspace = useCallback(
-    async (nextPath: string, openExplorer = false) => {
+    async (nextPath: string, openExplorer = false, opts?: { skipButlerWarn?: boolean }) => {
       const trimmed = nextPath.trim();
       if (!trimmed) return;
+      if (!opts?.skipButlerWarn && looksLikeButlerSourceRoot(trimmed)) {
+        const ok = window.confirm(BUTLER_SOURCE_WORKSPACE_WARNING);
+        if (!ok) return;
+      }
       setCwd(trimmed);
       persistAgentProjectRoot(trimmed);
+      rememberAgentWorkspace(trimmed);
+      refreshWorkspaceList();
+      setExpandedWorkspaces((prev) => {
+        const next = new Set(prev);
+        next.add(workspaceExpandKey(trimmed));
+        persistExpandedWorkspaceKeys([...next]);
+        return next;
+      });
       if (openExplorer) await openAgentWorkspaceInExplorer(trimmed);
       try {
         const scan = await scanAgentWorkspace(trimmed);
@@ -612,37 +1037,170 @@ export function AgentWindow({
       }
       void refreshCheckpoints();
     },
-    [refreshCheckpoints],
+    [refreshCheckpoints, refreshWorkspaceList],
   );
+
+  const setSelfEditEnvFlag = useCallback((on: boolean): Promise<void> => {
+    return new Promise((resolve) => {
+      setEnvVarRows((prev) => {
+        const key = 'BUTLER_ALLOW_SELF_EDIT';
+        const others = prev.filter((r) => r.key.trim() !== key);
+        const next = on
+          ? [
+              ...others,
+              {
+                id: `env-self-edit-${Date.now().toString(36)}`,
+                key,
+                value: '1',
+              },
+            ]
+          : others;
+        const record = recordFromRows(next);
+        persistAgentEnvVars(record);
+        void syncAgentEnvVarsToHost(record).finally(() => resolve());
+        return next;
+      });
+    });
+  }, []);
+
+  const setProductModePersist = useCallback(
+    (mode: AgentProductMode) => {
+      const prev = productMode;
+      setProductMode(mode);
+      try {
+        localStorage.setItem(AGENT_PRODUCT_MODE_KEY, mode);
+      } catch {
+        /* ignore */
+      }
+
+      if (mode === 'self-edit' && prev !== 'self-edit') {
+        try {
+          const current = cwd.trim();
+          const butlerRoot = defaultButlerSourceRoot();
+          if (current && !looksLikeButlerSourceRoot(current)) {
+            localStorage.setItem(AGENT_CWD_BEFORE_SELF_EDIT_KEY, current);
+          }
+          void setSelfEditEnvFlag(true);
+          void applyWorkspace(butlerRoot, false, { skipButlerWarn: true });
+          setMessages((m) => [
+            ...m,
+            {
+              id: `${Date.now()}-self-edit-on`,
+              role: 'assistant',
+              content:
+                'Self-edit mode ON. Workspace → Butler repo, writes unlocked with Accept/Reject + tests gate. ' +
+                'Checkpoint before large changes. Typed/voice turns use the coding agent; only short greetings stay on casual chat.',
+              source: 'Agent',
+            },
+          ]);
+        } catch {
+          void setSelfEditEnvFlag(true);
+        }
+        return;
+      }
+
+      if (prev === 'self-edit' && mode !== 'self-edit') {
+        void setSelfEditEnvFlag(false);
+        try {
+          const restore = localStorage.getItem(AGENT_CWD_BEFORE_SELF_EDIT_KEY)?.trim();
+          localStorage.removeItem(AGENT_CWD_BEFORE_SELF_EDIT_KEY);
+          if (restore && !looksLikeButlerSourceRoot(restore)) {
+            void applyWorkspace(restore, false, { skipButlerWarn: true });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    [applyWorkspace, cwd, productMode, setSelfEditEnvFlag],
+  );
+
+  // If Self-edit was last selected, re-assert ALLOW_SELF_EDIT after reload.
+  useEffect(() => {
+    if (productMode !== 'self-edit') return;
+    void setSelfEditEnvFlag(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- boot sync only
+  }, []);
 
   const restoreThreadState = useCallback(
     (thread: SavedAgentThread) => {
-      const nextMessages =
-        thread.messages.length > 0 ? thread.messages.map((m) => ({ ...m })) : [WELCOME_MESSAGE];
+      // Drop legacy welcome seeds so restored threads stay blank until real messages.
+      const nextMessages = thread.messages
+        .filter((m) => !isAgentWelcomeMessage(m))
+        .map((m) => ({ ...m }));
       const nextCwd = thread.cwd?.trim() || defaultAgentProjectRoot();
+      const nextMode: AgentProductMode =
+        thread.productMode === 'chat' ||
+        thread.productMode === 'code' ||
+        thread.productMode === 'self-edit'
+          ? thread.productMode
+          : nextMessages.some((m) => Array.isArray(m.steps) && m.steps.length > 0)
+            ? 'code'
+            : readProductMode();
       setMessages(nextMessages);
       setCwd(nextCwd);
       persistAgentProjectRoot(nextCwd);
+      setProductModePersist(nextMode);
       setLoadedThreadId(thread.id);
-      setSavedFingerprint(agentThreadFingerprint(nextMessages, nextCwd));
+      setSavedFingerprint(agentThreadFingerprint(nextMessages, nextCwd, nextMode));
       setLiveSteps([]);
       setRunStatus(null);
       setInput('');
       void applyWorkspace(nextCwd, false);
     },
+    [applyWorkspace, setProductModePersist],
+  );
+
+  const handleToggleWorkspaceExpand = useCallback((workspacePath: string) => {
+    const key = workspaceExpandKey(workspacePath);
+    setExpandedWorkspaces((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      persistExpandedWorkspaceKeys([...next]);
+      return next;
+    });
+  }, []);
+
+  const handleSelectWorkspace = useCallback(
+    async (workspacePath: string) => {
+      const trimmed = workspacePath.trim();
+      if (!trimmed) return;
+      const key = workspaceExpandKey(trimmed);
+      setExpandedWorkspaces((prev) => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.add(key);
+        persistExpandedWorkspaceKeys([...next]);
+        return next;
+      });
+      await applyWorkspace(trimmed, false);
+    },
     [applyWorkspace],
   );
 
-  const resetToNewThread = useCallback(() => {
-    const nextCwd = cwd.trim() || defaultAgentProjectRoot();
-    setMessages([WELCOME_MESSAGE]);
-    setLiveSteps([]);
-    setRunStatus(null);
-    setInput('');
-    setLoadedThreadId(null);
-    setSavedFingerprint(agentThreadFingerprint([WELCOME_MESSAGE], nextCwd));
-  }, [cwd]);
+  const handleAddWorkspace = useCallback(async () => {
+    const picked = await browseAgentWorkspace(cwd);
+    if (!picked) return;
+    await applyWorkspace(picked, false);
+  }, [applyWorkspace, cwd]);
 
+  const handleNewThreadInWorkspace = useCallback(
+    async (workspacePath: string) => {
+      if (isDirty && !confirmDiscardUnsaved()) return;
+      const nextCwd = workspacePath.trim() || defaultAgentProjectRoot();
+      await applyWorkspace(nextCwd, false);
+      setMessages([]);
+      setLiveSteps([]);
+      setRunStatus(null);
+      setInput('');
+      setLoadedThreadId(null);
+      setSavedFingerprint(agentThreadFingerprint([], nextCwd, productMode));
+    },
+    [applyWorkspace, isDirty, productMode],
+  );
+
+  const [threadSaveNotice, setThreadSaveNotice] = useState<string | null>(null);
   const handleBrowse = useCallback(async () => {
     const picked = await browseAgentWorkspace(cwd);
     if (picked) await applyWorkspace(picked, false);
@@ -651,55 +1209,68 @@ export function AgentWindow({
   const openFooterTab = useCallback((tab: AgentFooterTab) => {
     setFooterTab(tab);
     setFooterOpen(true);
-    if (tab === 'browser') {
-      setFooterHeightPx((prev) =>
-        prev < AGENT_FOOTER_BROWSER_DEFAULT_PX ? AGENT_FOOTER_BROWSER_DEFAULT_PX : prev,
+  }, []);
+
+
+
+
+
+  const appendLiveLog = useCallback((line: string) => {
+    const time = new Date().toLocaleTimeString();
+    setLiveLog((prev) => [...prev.slice(-49), `[${time}] ${line}`]);
+  }, []);
+
+  const triggerDesktopRebuild = useCallback(
+    async (fast = true) => {
+      if (rebuildBusy) return;
+      setRebuildBusy(true);
+      openFooterTab('output');
+      appendLiveLog(
+        fast
+          ? 'Starting fast desktop rebuild (vite + asar patch)…'
+          : 'Starting full desktop rebuild…',
       );
-    }
-  }, []);
-
-  const toggleBrowserMaximized = useCallback(() => {
-    setBrowserMaximized((prev) => {
-      const next = !prev;
-      if (next) {
-        setFooterTab('browser');
-        setFooterOpen(true);
-        setFooterHeightPx((current) =>
-          current < AGENT_FOOTER_BROWSER_DEFAULT_PX ? AGENT_FOOTER_BROWSER_DEFAULT_PX : current,
-        );
+      try {
+        const res = await fetch('/api/butler/rebuild', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fast }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+        const msg = data.message || (data.ok ? 'Rebuild started.' : 'Rebuild failed.');
+        appendLiveLog(msg);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-rebuild`,
+            role: 'assistant',
+            content: msg,
+            source: 'Agent',
+            error: !data.ok,
+          },
+        ]);
+      } catch (err) {
+        const msg = `Rebuild request failed: ${String((err as Error)?.message || err)}`;
+        appendLiveLog(msg);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-rebuild-err`,
+            role: 'assistant',
+            content: msg,
+            source: 'Agent',
+            error: true,
+          },
+        ]);
+      } finally {
+        setRebuildBusy(false);
       }
-      return next;
-    });
-  }, []);
-
-  useEffect(() => {
-    if (!browserMaximized) return;
-    setFooterTab('browser');
-    setFooterOpen(true);
-  }, [browserMaximized]);
-
-  useEffect(() => {
-    if (!browserMaximized) return;
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      setBrowserMaximized(false);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [browserMaximized]);
+    },
+    [appendLiveLog, openFooterTab, rebuildBusy],
+  );
 
   const handleThemeChange = useCallback((prefs: AgentThemePrefs) => {
     setTheme(prefs);
-  }, []);
-
-  const setProductModePersist = useCallback((mode: AgentProductMode) => {
-    setProductMode(mode);
-    try {
-      localStorage.setItem(AGENT_PRODUCT_MODE_KEY, mode);
-    } catch {
-      /* ignore */
-    }
   }, []);
 
   const openUtilityPanel = useCallback(() => {
@@ -728,7 +1299,7 @@ export function AgentWindow({
       const history = opts.history
         .filter((m) => m.id !== 'welcome' && (m.role === 'user' || m.role === 'assistant'))
         .filter((m) => typeof m.content === 'string' && m.content.trim())
-        .slice(-24)
+        .slice(effectiveVoiceMode ? -6 : -24)
         .map((m) => ({ role: m.role, content: m.content }));
       let initImageB64: string | undefined;
       let fileAttachment:
@@ -751,42 +1322,164 @@ export function AgentWindow({
             };
         }
       }
-      const res = await fetch('/api/chat', {
+      const ac = new AbortController();
+      chatAbortRef.current = ac;
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: ac.signal,
+          body: JSON.stringify({
+            sessionId: chatSessionId,
+            message: opts.message,
+            history,
+            localOnly: true,
+            voice_conversation: !!effectiveVoiceModeRef.current,
+            chat_formality: loadChatFormality(),
+            ...(initImageB64 ? { init_image: initImageB64 } : {}),
+            ...(fileAttachment ? { attachment: fileAttachment } : {}),
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          reply?: string;
+          message?: string;
+          error?: string;
+          source?: string;
+          images?: string[];
+          open_browser?: boolean;
+          openBrowser?: boolean;
+        };
+        if (!res.ok) {
+          throw new Error(data.message || data.error || `Chat failed (${res.status})`);
+        }
+        const replyText = String(data.reply || '').trim() || '…';
+        const assistantMsg: AgentChatMessage = {
+          id: `${Date.now()}-assistant`,
+          role: 'assistant',
+          content: replyText,
+          source: data.source || 'Butler',
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+        setRunStatus(null);
+        setActiveModelLabel(data.source || 'Butler');
+        if (data.open_browser || data.openBrowser) {
+          openAgentBrowserPopout();
+        }
+        if (effectiveVoiceModeRef.current && replyText && replyText !== '…') {
+          speakReplyRef.current(replyText);
+        }
+        return data;
+      } finally {
+        if (chatAbortRef.current === ac) chatAbortRef.current = null;
+      }
+    },
+    [chatSessionId],
+  );
+
+  const latestScreenAttach = useCallback((): ChatAttach | null => {
+    const cap = screenCaptureRef.current;
+    if (!cap?.isActive()) return null;
+    const frame = cap.getLatestFrame();
+    return frame ? screenFrameToAttach(frame) : null;
+  }, []);
+
+  const stopScreenShare = useCallback(async () => {
+    const cap = screenCaptureRef.current;
+    screenCaptureRef.current = null;
+    setScreenSharing(false);
+    setScreenShareError(null);
+    if (cap) {
+      try {
+        await cap.stop();
+      } catch {
+        /* */
+      }
+    }
+  }, []);
+
+  const startScreenShare = useCallback(async () => {
+    if (screenCaptureRef.current?.isActive()) {
+      setScreenSharing(true);
+      return;
+    }
+    setScreenShareBusy(true);
+    setScreenShareError(null);
+    try {
+      await screenCaptureRef.current?.stop();
+      const cap = new SilentScreenCapture({
+        maxSide: 896,
+        quality: 0.55,
+        intervalMs: 280,
+        onStopped: () => {
+          if (screenCaptureRef.current === cap) {
+            screenCaptureRef.current = null;
+            setScreenSharing(false);
+          }
+        },
+        onError: (err) => {
+          setScreenShareError(err.message || 'Screen capture failed');
+        },
+      });
+      screenCaptureRef.current = cap;
+      await cap.start();
+      setScreenSharing(true);
+    } catch (err) {
+      screenCaptureRef.current = null;
+      setScreenSharing(false);
+      const msg = err instanceof Error ? err.message : String(err);
+      setScreenShareError(msg.trim() || 'Could not start screen share');
+    } finally {
+      setScreenShareBusy(false);
+    }
+  }, []);
+
+  const handleToggleScreenShare = useCallback(() => {
+    if (screenSharing || screenCaptureRef.current?.isActive()) {
+      void stopScreenShare();
+      return;
+    }
+    void startScreenShare();
+  }, [screenSharing, startScreenShare, stopScreenShare]);
+
+  useEffect(() => {
+    return () => {
+      void screenCaptureRef.current?.stop();
+      screenCaptureRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => subscribeScreenAssistPrefs(() => setScreenLookMode(getScreenLookModeEnabled())), []);
+
+  // Optional idle glance — default off. Never runs every video frame.
+  useEffect(() => {
+    if (!screenSharing || !screenLookMode) return;
+    const tick = () => {
+      if (screenLookInFlightRef.current || sendingRef.current) return;
+      const frame = screenCaptureRef.current?.getLatestFrame();
+      if (!frame?.dataUrl) return;
+      const parsed = parseComposerDataUrl(frame.dataUrl);
+      if (!parsed?.base64) return;
+      screenLookInFlightRef.current = true;
+      void fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionId: chatSessionId,
-          message: opts.message,
-          history,
+          message:
+            'Glance only: one short clause naming the main app/UI on screen. No advice unless asked.',
+          history: [],
           localOnly: true,
-          ...(initImageB64 ? { init_image: initImageB64 } : {}),
-          ...(fileAttachment ? { attachment: fileAttachment } : {}),
+          init_image: parsed.base64,
         }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        reply?: string;
-        message?: string;
-        error?: string;
-        source?: string;
-        images?: string[];
-      };
-      if (!res.ok) {
-        throw new Error(data.message || data.error || `Chat failed (${res.status})`);
-      }
-      const replyText = String(data.reply || '').trim() || '…';
-      const assistantMsg: AgentChatMessage = {
-        id: `${Date.now()}-assistant`,
-        role: 'assistant',
-        content: replyText,
-        source: data.source || 'Butler',
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
-      setRunStatus(null);
-      setActiveModelLabel(data.source || 'Butler');
-      return data;
-    },
-    [chatSessionId],
-  );
+      })
+        .catch(() => undefined)
+        .finally(() => {
+          screenLookInFlightRef.current = false;
+        });
+    };
+    const id = window.setInterval(tick, SCREEN_LOOK_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [screenSharing, screenLookMode, chatSessionId]);
 
   const handleUtilitySideSend = useCallback(
     async (
@@ -805,7 +1498,7 @@ export function AgentWindow({
         await runChatRequest({
           message,
           history: messages.filter((m) => m.id !== 'welcome'),
-          attachment,
+          attachment: attachment || latestScreenAttach(),
         });
       } catch (err) {
         const raw = err instanceof Error ? err.message : String(err);
@@ -824,7 +1517,7 @@ export function AgentWindow({
         setSending(false);
       }
     },
-    [messages, runChatRequest, setProductModePersist],
+    [messages, runChatRequest, setProductModePersist, latestScreenAttach],
   );
 
   useEffect(() => {
@@ -844,66 +1537,171 @@ export function AgentWindow({
       history: AgentChatMessage[];
       continue?: boolean;
       statusLabel?: string;
+      /** Voice chat → code agent: speak checklist once + final reply only (no tool noise). */
+      voiceCodingHandoff?: boolean;
     }) => {
       const providerLabel = selectedProviderMeta.label;
+      const voiceHandoff = Boolean(opts.voiceCodingHandoff);
+      let checklistSpoken = false;
+      const AUTO_CONTINUE_MAX = 4;
+      const ac = new AbortController();
+      try {
+        chatAbortRef.current?.abort();
+      } catch {
+        /* */
+      }
+      chatAbortRef.current = ac;
+      setCancelRequested(false);
       setActiveModelLabel(providerLabel);
       setRunStatus({
         status: 'starting',
         message: opts.statusLabel || `Starting agent (${providerLabel})…`,
         iteration: 0,
-        max_iterations: 16,
+        max_iterations: 48,
         model_source: providerLabel,
       });
       setLiveSteps([]);
       setLiveTodos([]);
+      agentShellSeenRef.current.clear();
       persistAgentProjectRoot(cwd);
       const sendProvider = resolveSendProvider(cascadeEnabled, agentProvider);
-      const data = await sendAgentTurn(
-        {
-          message: opts.message,
-          history: opts.history,
-          cwd,
-          localOnly: sendProvider === 'local',
-          provider: sendProvider,
-          apiKeys,
-          continue: opts.continue,
-        },
-        (st) => {
-          setRunStatus(st);
-          if (st.model_source) setActiveModelLabel(st.model_source);
-          else if (st.model_used) setActiveModelLabel(st.model_used);
-          if (Array.isArray(st.todos) && st.todos.length > 0) {
-            setLiveTodos(st.todos as AgentTodo[]);
+
+      const onProgress = (st: AgentRunStatus) => {
+        setRunStatus(st);
+        if (st.model_source) setActiveModelLabel(st.model_source);
+        else if (st.model_used) setActiveModelLabel(st.model_used);
+        if (Array.isArray(st.todos) && st.todos.length > 0) {
+          setLiveTodos(st.todos as AgentTodo[]);
+          if (voiceHandoff && effectiveVoiceModeRef.current && !checklistSpoken) {
+            checklistSpoken = true;
+            const checklist = formatTodosChecklistSpeech(st.todos as AgentTodo[]);
+            if (checklist) speakReplyRef.current(checklist);
           }
-          if (Array.isArray(st.steps) && st.steps.length > 0) {
-            setLiveSteps(st.steps);
-          } else if (st.status === 'tool' && st.message) {
-            setLiveSteps((prev) => {
-              const pending: AgentToolStep = {
-                type: 'tool',
-                tool: 'working',
-                activity: st.message,
-                in_progress: true,
-                iteration: st.iteration,
+        }
+        if (Array.isArray(st.steps) && st.steps.length > 0) {
+          setLiveSteps(st.steps);
+          // Mirror agent shell tools into the Terminal panel (live stdout while running).
+          for (const step of st.steps) {
+            const tool = String(step.tool || '').toLowerCase();
+            if (tool !== 'run_shell' && tool !== 'run_command') continue;
+            const cmd = String(step.args?.command || '').trim();
+            if (!cmd) continue;
+            const stepKey = `agent-shell-${step.iteration ?? 0}-${tool}-${cmd.slice(0, 80)}`;
+            const result = step.result || {};
+            const stdout = String(result.stdout || '');
+            const stderr = String(result.stderr || '');
+            const running = Boolean(step.in_progress);
+            const cwdPath = String(step.args?.cwd || st.project_root || cwd || '').trim();
+            setFooterOpen(true);
+            setFooterTab('terminal');
+            setTerminalEntries((prev) => {
+              const existing = prev.find((e) => e.id === stepKey);
+              if (!existing && !agentShellSeenRef.current.has(stepKey)) {
+                agentShellSeenRef.current.add(stepKey);
+              }
+              const nextEntry: TerminalEntry = {
+                id: stepKey,
+                command: cmd,
+                cwd: cwdPath || existing?.cwd || cwd,
+                source: 'agent',
+                shellLabel: 'Agent',
+                running,
+                liveStdout: running ? stdout || stderr : undefined,
+                result: running
+                  ? undefined
+                  : {
+                      ok: result.ok !== false && !result.error,
+                      command: cmd,
+                      cwd: cwdPath || existing?.cwd || cwd,
+                      stdout,
+                      stderr,
+                      code:
+                        typeof result.exit_code === 'number'
+                          ? result.exit_code
+                          : result.ok === false
+                            ? 1
+                            : 0,
+                      message: result.error ? String(result.error) : undefined,
+                    },
               };
-              const withoutPending = prev.filter((s) => !s.in_progress);
-              return [...withoutPending, pending];
+              if (existing) {
+                return prev.map((e) => (e.id === stepKey ? { ...e, ...nextEntry } : e));
+              }
+              return [nextEntry, ...prev].slice(0, 80);
             });
           }
-        },
-      );
-      const replyText =
-        unwrapAgentReply(String(data.reply || '').trim()) || 'Done.';
-      const steps = Array.isArray(data.agent_steps) ? data.agent_steps : undefined;
-      const needsContinue =
-        Boolean(data.needs_continue) || looksLikeIncompleteAgentReply(replyText, steps);
+        } else if (st.status === 'tool' && st.message) {
+          setLiveSteps((prev) => {
+            const pending: AgentToolStep = {
+              type: 'tool',
+              tool: 'working',
+              activity: st.message,
+              in_progress: true,
+              iteration: st.iteration,
+            };
+            const withoutPending = prev.filter((s) => !s.in_progress);
+            return [...withoutPending, pending];
+          });
+        }
+      };
+
+      let data: Awaited<ReturnType<typeof sendAgentTurn>> | null = null;
+      let mergedSteps: AgentToolStep[] = [];
+      let lastTodos: AgentTodo[] | undefined;
+      let replyText = 'Done.';
+      let needsContinue = false;
+      let round = 0;
+
+      while (round <= AUTO_CONTINUE_MAX) {
+        if (ac.signal.aborted) {
+          throw new DOMException('Agent turn aborted', 'AbortError');
+        }
+        const isContinue = Boolean(opts.continue) || round > 0;
+        if (round > 0) {
+          setRunStatus({
+            status: 'starting',
+            message: `Auto-continuing (${round}/${AUTO_CONTINUE_MAX})…`,
+            iteration: 0,
+            max_iterations: 48,
+            model_source: providerLabel,
+          });
+        }
+        data = await sendAgentTurn(
+          {
+            message: opts.message,
+            history: opts.history,
+            cwd,
+            localOnly: sendProvider === 'local',
+            provider: sendProvider,
+            apiKeys,
+            continue: isContinue,
+            signal: ac.signal,
+          },
+          onProgress,
+        );
+        const steps = Array.isArray(data.agent_steps) ? data.agent_steps : [];
+        mergedSteps = [...mergedSteps, ...steps];
+        if (Array.isArray(data.todos) && data.todos.length > 0) {
+          lastTodos = data.todos as AgentTodo[];
+        }
+        replyText = unwrapAgentReply(String(data.reply || '').trim()) || 'Done.';
+        needsContinue =
+          Boolean(data.needs_continue) || looksLikeIncompleteAgentReply(replyText, steps);
+        if (!needsContinue || round >= AUTO_CONTINUE_MAX) break;
+        round += 1;
+      }
+
+      if (!data) {
+        throw new Error('Agent returned no response');
+      }
+
       const assistantMsg: AgentChatMessage = {
         id: `${Date.now()}-assistant`,
         role: 'assistant',
         content: replyText,
-        source: data.source || 'Agent',
-        steps,
-        todos: Array.isArray(data.todos) ? (data.todos as AgentTodo[]) : undefined,
+        source: data.source || (voiceHandoff ? 'Butler' : 'Agent'),
+        steps: mergedSteps.length > 0 ? mergedSteps : undefined,
+        todos: lastTodos,
         needsContinue,
       };
       setMessages((prev) => [...prev, assistantMsg]);
@@ -912,70 +1710,519 @@ export function AgentWindow({
       setRunStatus(null);
       if (data.source) setActiveModelLabel(data.source);
       void refreshCheckpoints();
-      return data;
+      if (data.needs_review && data.self_edit_review) {
+        setSelfEditReview(data.self_edit_review);
+        setPendingReviews((prev) => upsertPendingReview(prev, data.self_edit_review!));
+        void loadReviewChanges(data.self_edit_review);
+        // Prefer the turn payload so a slow/empty list API cannot wipe Reviews.
+        void refreshSelfEditReview({ prefer: data.self_edit_review });
+      } else {
+        void refreshSelfEditReview();
+      }
+      if (voiceHandoff && effectiveVoiceModeRef.current) {
+        if (data.needs_review) {
+          speakReplyRef.current(
+            data.self_edit_review?.voice_hint || 'Review the diffs when you are ready',
+          );
+        } else if (replyText) {
+          speakReplyRef.current(replyText);
+        }
+      }
+      return { ...data, agent_steps: mergedSteps, needs_continue: needsContinue, reply: replyText };
     },
-    [cwd, refreshCheckpoints, agentProvider, cascadeEnabled, apiKeys, selectedProviderMeta],
+    [
+      cwd,
+      refreshCheckpoints,
+      refreshSelfEditReview,
+      loadReviewChanges,
+      agentProvider,
+      cascadeEnabled,
+      apiKeys,
+      selectedProviderMeta,
+    ],
+  );
+
+  const sendPrompt = useCallback(
+    async (raw: string, opts?: { clearInput?: boolean }) => {
+      const trimmed = raw.trim();
+      const attach = chatAttachment || latestScreenAttach();
+      if (!trimmed && !attach) return;
+      // If currently sending, queue the message instead
+      if (sending) {
+        if (trimmed) setMessageQueue((prev) => [...prev, trimmed]);
+        if (opts?.clearInput !== false) setInput('');
+        return;
+      }
+      if (looksLikeOpenBrowserAsk(trimmed) && !chatAttachment && !latestScreenAttach()) {
+        stickChatToBottomRef.current = true;
+        const userMsg: AgentChatMessage = {
+          id: String(Date.now()),
+          role: 'user',
+          content: trimmed,
+        };
+        const assistantMsg: AgentChatMessage = {
+          id: `${Date.now()}-browser`,
+          role: 'assistant',
+          content: OPEN_BROWSER_CHAT_REPLY,
+          source: 'Butler',
+        };
+        if (opts?.clearInput !== false) setInput('');
+        setChatAttachment(null);
+        setMessages((prev) => [...prev, userMsg, assistantMsg]);
+        openAgentBrowserPopout();
+        requestAnimationFrame(() => inputRef.current?.focus());
+        return;
+      }
+      stickChatToBottomRef.current = true;
+      cancelledMessageRef.current = trimmed || (attach ? `(image: ${attach.name})` : '');
+      const userMsg: AgentChatMessage = {
+        id: String(Date.now()),
+        role: 'user',
+        content: trimmed || (attach ? `📷 ${attach.name}` : ''),
+      };
+      if (opts?.clearInput !== false) setInput('');
+      setChatAttachment(null);
+      setMessages((prev) => [...prev, userMsg]);
+      setSending(true);
+      try {
+        const history = messages.filter((m) => m.id !== 'welcome');
+        const screenCtx =
+          !!attach &&
+          !chatAttachment &&
+          !!screenCaptureRef.current?.isActive() &&
+          attach.name === 'live-screen.jpg';
+        const selfEditAsk = looksLikeSelfEditAsk(trimmed);
+        const codingAsk = looksLikeCodingTask(trimmed) || selfEditAsk;
+        const purePhatic = looksLikePurePhatic(trimmed);
+        // Self-edit / Code default to the coding agent. Chat mode stays casual unless
+        // voice hands off a coding ask. Only narrow phatic stays on /api/chat in Self-edit.
+        const useChatPath =
+          productMode === 'chat' ||
+          (productMode === 'self-edit' && purePhatic) ||
+          (productMode !== 'self-edit' && screenCtx && !codingAsk);
+        if (useChatPath) {
+          const voiceCoding =
+            !!effectiveVoiceModeRef.current && codingAsk;
+          if (voiceCoding) {
+            if (selfEditAsk && productMode !== 'self-edit') {
+              setProductModePersist('self-edit');
+            }
+            await runAgentRequest({
+              message: trimmed || (attach ? `I attached an image: ${attach.name}` : ''),
+              history,
+              statusLabel: `Starting coding agent (${selectedProviderMeta.label})…`,
+              voiceCodingHandoff: true,
+            });
+          } else {
+            await runChatRequest({
+              message: trimmed || 'What do you see in this image?',
+              history,
+              attachment: attach,
+            });
+          }
+        } else {
+          if (selfEditAsk && productMode === 'code') {
+            setProductModePersist('self-edit');
+          }
+          await runAgentRequest({
+            message: trimmed || (attach ? `I attached an image: ${attach.name}` : ''),
+            history,
+            statusLabel: `Starting agent (${selectedProviderMeta.label})…`,
+            voiceCodingHandoff: !!effectiveVoiceModeRef.current,
+          });
+        }
+      } catch (err) {
+        const aborted =
+          (err instanceof DOMException && err.name === 'AbortError') ||
+          (typeof (err as { name?: string })?.name === 'string' &&
+            (err as { name: string }).name === 'AbortError') ||
+          /abort/i.test(String((err as { message?: string })?.message || ''));
+        if (aborted) {
+          setRunStatus(null);
+          setLiveSteps([]);
+          setLiveTodos([]);
+          return;
+        }
+        const errRaw = err instanceof Error ? err.message : String(err);
+        const msg =
+          (errRaw || '').trim() && !/^\{?\s*"?error"?\s*:\s*""/.test(errRaw.trim())
+            ? errRaw.trim()
+            : productMode === 'chat'
+              ? 'Chat failed with an empty error.'
+              : 'Agent failed with an empty error. Check Knowledge logs for MemoryError / traceback after large tool results.';
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-err`,
+            role: 'assistant',
+            content: msg,
+            error: true,
+            source: productMode === 'chat' ? 'Butler' : 'Agent',
+          },
+        ]);
+        setRunStatus(null);
+        setLiveSteps([]);
+        setLiveTodos([]);
+        setActiveModelLabel(null);
+        if (effectiveVoiceModeRef.current && msg) speakReplyRef.current(msg);
+      } finally {
+        setSending(false);
+        setCancelRequested(false);
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
+    },
+    [
+      sending,
+      messages,
+      productMode,
+      runChatRequest,
+      runAgentRequest,
+      selectedProviderMeta,
+      chatAttachment,
+      latestScreenAttach,
+      setProductModePersist,
+    ],
   );
 
   const handleSend = useCallback(async () => {
-    const trimmed = input.trim();
-    if (!trimmed) return;
-    // If currently sending, queue the message instead
-    if (sending) {
-      setMessageQueue((prev) => [...prev, trimmed]);
-      setInput('');
+    await sendPrompt(input);
+  }, [input, sendPrompt]);
+
+  const submitFromVoice = useCallback(
+    (text: string) => {
+      // Keep Self-edit / Code mode across voice turns — do NOT force Chat
+      // (that used to clear BUTLER_ALLOW_SELF_EDIT mid-conversation).
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      // While Butler is still speaking, ignore STT echo / bleed. Real barge-in
+      // cancels TTS first (onBargeInStart), then the transcript arrives.
+      if (localSpeakingRef.current || isNeuralSpeaking()) {
+        return;
+      }
+      if (looksLikeOpenBrowserAsk(trimmed)) {
+        stickChatToBottomRef.current = true;
+        const userMsg: AgentChatMessage = {
+          id: String(Date.now()),
+          role: 'user',
+          content: trimmed,
+        };
+        const assistantMsg: AgentChatMessage = {
+          id: `${Date.now()}-browser`,
+          role: 'assistant',
+          content: OPEN_BROWSER_CHAT_REPLY,
+          source: 'Butler',
+        };
+        setMessages((prev) => [...prev, userMsg, assistantMsg]);
+        openAgentBrowserPopout();
+        return;
+      }
+      // Barge-in while a turn is in flight: abort chat TTS/request when possible.
+      if (sending) {
+        cancelNeuralSpeech();
+        setLocalSpeaking(false);
+        try {
+          chatAbortRef.current?.abort();
+        } catch {
+          /* */
+        }
+      }
+      stickChatToBottomRef.current = true;
+      const userMsg: AgentChatMessage = {
+        id: String(Date.now()),
+        role: 'user',
+        content: trimmed,
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setSending(true);
+      const selfEditAsk = looksLikeSelfEditAsk(trimmed);
+      const coding = looksLikeCodingTask(trimmed) || selfEditAsk;
+      const purePhatic = looksLikePurePhatic(trimmed);
+      const useAgent = isCodingProductMode(productMode) ? !purePhatic : coding;
+      const history = messages.filter((m) => m.id !== 'welcome');
+      const screenAttach = latestScreenAttach();
+      void (async () => {
+        try {
+          if (useAgent) {
+            if (selfEditAsk && productMode !== 'self-edit') {
+              setProductModePersist('self-edit');
+            }
+            await runAgentRequest({
+              message: trimmed,
+              history,
+              statusLabel: `Starting coding agent (${selectedProviderMeta.label})…`,
+              voiceCodingHandoff: true,
+            });
+          } else {
+            await runChatRequest({
+              message: trimmed,
+              history,
+              attachment: screenAttach,
+            });
+          }
+        } catch (err) {
+          const aborted =
+            (err instanceof Error && err.name === 'AbortError') ||
+            (typeof (err as { message?: string })?.message === 'string' &&
+              /abort/i.test(String((err as { message?: string }).message)));
+          if (aborted) return;
+          const errRaw = err instanceof Error ? err.message : String(err);
+          const msg =
+            (errRaw || '').trim() && !/^\{?\s*"?error"?\s*:\s*""/.test(errRaw.trim())
+              ? errRaw.trim()
+              : useAgent
+                ? 'Coding agent failed with an empty error.'
+                : 'Chat failed with an empty error.';
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `${Date.now()}-err`,
+              role: 'assistant',
+              content: msg,
+              error: true,
+              source: useAgent ? 'Agent' : 'Butler',
+            },
+          ]);
+          setRunStatus(null);
+          setLiveSteps([]);
+          setLiveTodos([]);
+          if (effectiveVoiceModeRef.current && msg) speakReplyRef.current(msg);
+        } finally {
+          setSending(false);
+        }
+      })();
+    },
+    [
+      sending,
+      messages,
+      productMode,
+      runChatRequest,
+      runAgentRequest,
+      setProductModePersist,
+      selectedProviderMeta,
+      latestScreenAttach,
+    ],
+  );
+  submitFromVoiceRef.current = submitFromVoice;
+
+  const speakAgentReply = useCallback(
+    (text: string) => {
+      if (voiceOwnedByApp) {
+        onSpeakReply?.(text);
+        return;
+      }
+      if (!text?.trim() || typeof window === 'undefined') return;
+      cancelNeuralSpeech();
+      setLocalSpeaking(false);
+      void speakNeural(text, {
+        onStart: () => setLocalSpeaking(true),
+        onEnd: () => setLocalSpeaking(false),
+        onError: (err) => {
+          console.warn('[Butler speakAgentReply]', err?.message || err);
+          setLocalSpeaking(false);
+        },
+      });
+    },
+    [voiceOwnedByApp, onSpeakReply],
+  );
+  speakReplyRef.current = speakAgentReply;
+
+  useEffect(() => {
+    if (!onRegisterVoiceSink) return;
+    // Voice sink: Chat presentation; coding asks hand off to Code agent under the hood.
+    onRegisterVoiceSink(submitFromVoice);
+    return () => onRegisterVoiceSink(null);
+  }, [onRegisterVoiceSink, submitFromVoice]);
+
+  useEffect(() => {
+    onVoiceBusyChange?.(sending);
+  }, [sending, onVoiceBusyChange]);
+
+  useEffect(() => {
+    // Mute pauses STT / barge-in; keep mic open otherwise so the user can interrupt TTS.
+    localVoicePauseRef.current = localMicMuted;
+    localSpeakingRef.current = localSpeaking;
+    sendingRef.current = sending;
+  }, [sending, localSpeaking, localMicMuted]);
+
+  useEffect(() => {
+    if (effectiveVoiceMode) return;
+    setLocalMicMuted(false);
+    // Reveal transcript after voice call — land at the latest messages.
+    stickChatToBottomRef.current = true;
+    requestAnimationFrame(() => {
+      threadEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    });
+  }, [effectiveVoiceMode]);
+
+  useEffect(() => {
+    if (voiceOwnedByApp) return;
+    let cancelled = false;
+    void fetch('/api/settings')
+      .then((r) => r.json())
+      .then((s: { voiceMode?: boolean }) => {
+        if (!cancelled && s?.voiceMode) setLocalVoiceMode(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [voiceOwnedByApp]);
+
+  useEffect(() => {
+    if (voiceOwnedByApp || !localVoiceMode) {
+      setLocalUserSpeaking(false);
+      setMicLevel(0);
       return;
     }
-    stickChatToBottomRef.current = true;
-    cancelledMessageRef.current = trimmed;
-    const userMsg: AgentChatMessage = {
-      id: String(Date.now()),
-      role: 'user',
-      content: trimmed,
+    const ac = new AbortController();
+    const stopInner = startVoiceModePcmAutoListen({
+      shouldPause: () => localVoicePauseRef.current,
+      elevatedThreshold: () => localSpeakingRef.current || isNeuralSpeaking(),
+      onBargeInStart: () => {
+        cancelNeuralSpeech();
+        setLocalSpeaking(false);
+        try {
+          chatAbortRef.current?.abort();
+        } catch {
+          /* */
+        }
+      },
+      onTranscript: (text) => submitFromVoiceRef.current(text),
+      signal: ac.signal,
+      onUtteranceActive: (active) => setLocalUserSpeaking(active),
+      onLevel: (level) => setMicLevel(level),
+      onMicAccessFailed: (msg) => setSpeechError(msg),
+      onSttFailed: (msg) => setSpeechError(`Speech-to-text: ${msg}`),
+    });
+    return () => {
+      ac.abort();
+      stopInner();
+      setLocalUserSpeaking(false);
+      setMicLevel(0);
     };
-    setInput('');
-    setMessages((prev) => [...prev, userMsg]);
-    setSending(true);
-    try {
-      if (productMode === 'chat') {
-        await runChatRequest({
-          message: trimmed,
-          history: messages.filter((m) => m.id !== 'welcome'),
-        });
-      } else {
-        await runAgentRequest({
-          message: trimmed,
-          history: messages.filter((m) => m.id !== 'welcome'),
-          statusLabel: `Starting agent (${selectedProviderMeta.label})…`,
-        });
-      }
-    } catch (err) {
-      const raw = err instanceof Error ? err.message : String(err);
-      const msg =
-        (raw || '').trim() && !/^\{?\s*"?error"?\s*:\s*""/.test(raw.trim())
-          ? raw.trim()
-          : productMode === 'chat'
-            ? 'Chat failed with an empty error.'
-            : 'Agent failed with an empty error. Check Knowledge logs for MemoryError / traceback after large tool results.';
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-err`,
-          role: 'assistant',
-          content: msg,
-          error: true,
-          source: productMode === 'chat' ? 'Butler' : 'Agent',
-        },
-      ]);
-      setRunStatus(null);
-      setLiveSteps([]);
-      setLiveTodos([]);
-      setActiveModelLabel(null);
-    } finally {
-      setSending(false);
-      requestAnimationFrame(() => inputRef.current?.focus());
+  }, [voiceOwnedByApp, localVoiceMode]);
+
+  /** When App owns STT, still meter the mic so the waveform reacts. */
+  useEffect(() => {
+    if (!voiceOwnedByApp || !voiceMode) {
+      if (voiceOwnedByApp) setMicLevel(0);
+      return;
     }
-  }, [input, sending, messages, productMode, runChatRequest, runAgentRequest, selectedProviderMeta]);
+    let cancelled = false;
+    let ctx: AudioContext | null = null;
+    let stream: MediaStream | null = null;
+    let raf = 0;
+    void (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        ctx = new AudioContext();
+        const src = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        src.connect(analyser);
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        const tick = () => {
+          if (cancelled) return;
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i]! - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          setMicLevel(Math.max(0, Math.min(1, (rms - 0.02) / 0.25)));
+          raf = requestAnimationFrame(tick);
+        };
+        raf = requestAnimationFrame(tick);
+      } catch {
+        /* mic already requested by App voice loop */
+      }
+    })();
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      void ctx?.close();
+      stream?.getTracks().forEach((t) => t.stop());
+      setMicLevel(0);
+    };
+  }, [voiceOwnedByApp, voiceMode]);
+
+  const handleToggleVoiceMode = useCallback(() => {
+    if (voiceOwnedByApp) {
+      // Do not force Chat — preserves Self-edit / Code + BUTLER_ALLOW_SELF_EDIT.
+      onToggleVoiceMode?.();
+      return;
+    }
+    const next = !localVoiceMode;
+    if (!next) {
+      setLocalVoiceMode(false);
+      setLocalMicMuted(false);
+      setLocalSpeaking(false);
+      setMicLevel(0);
+      cancelNeuralSpeech();
+      void fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voiceMode: false }),
+      }).catch(() => {});
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setSpeechError('No microphone API here. Use the Butler desktop app.');
+      return;
+    }
+    setLocalVoiceBusy(true);
+    void (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+        setSpeechError(null);
+        // Keep current product mode (Self-edit/Code) when starting voice.
+        setLocalMicMuted(false);
+        setLocalVoiceMode(true);
+        await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ voiceMode: true }),
+        }).catch(() => {});
+      } catch (err) {
+        const name =
+          err && typeof err === 'object' && 'name' in err ? String((err as DOMException).name) : '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          setSpeechError('Microphone blocked. Allow mic access for Butler.');
+        } else if (name === 'NotFoundError') {
+          setSpeechError('No microphone found.');
+        } else {
+          setSpeechError('Could not access the microphone.');
+        }
+      } finally {
+        setLocalVoiceBusy(false);
+      }
+    })();
+  }, [voiceOwnedByApp, onToggleVoiceMode, localVoiceMode]);
+
+  const handleToggleMicMute = useCallback(() => {
+    if (voiceOwnedByApp) {
+      onToggleMicMute?.();
+      return;
+    }
+    setLocalMicMuted((m) => !m);
+  }, [voiceOwnedByApp, onToggleMicMute]);
+
+  /** Waveform: start voice when off; mute/unmute mic while in voice mode (exit is End voice chat). */
+  const handleWaveformClick = useCallback(() => {
+    if (!effectiveVoiceMode) {
+      handleToggleVoiceMode();
+      return;
+    }
+    handleToggleMicMute();
+  }, [effectiveVoiceMode, handleToggleVoiceMode, handleToggleMicMute]);
 
   const handleContinue = useCallback(async () => {
     if (sending) return;
@@ -1040,7 +2287,15 @@ export function AgentWindow({
       const { pcm, sampleRate } = await capture.stop();
       capture.stream?.getTracks().forEach((track) => track.stop());
       if (mode === 'cancel') {
+        // When turning off speech-to-text, transcribe any captured audio and populate the input
+        try {
+          const text = await transcribePcmViaButler(pcm, sampleRate);
+          setInput((prev) => (prev ? `${prev} ${text}` : text).trim());
+        } catch {
+          // If transcription fails, just clear and focus
+        }
         setSpeechError(null);
+        requestAnimationFrame(() => inputRef.current?.focus());
         return;
       }
       const text = await transcribePcmViaButler(pcm, sampleRate);
@@ -1124,29 +2379,160 @@ export function AgentWindow({
     }
   };
 
-  const handleSaveThread = () => {
-    if (!agentThreadHasContent(messages)) {
-      window.alert('Nothing to save yet — send at least one message first.');
+  const handleRevertLastCheckpoint = useCallback(async () => {
+    const latest = checkpoints[0];
+    if (!latest?.id) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-cp-empty`,
+          role: 'assistant',
+          content: 'No checkpoints yet. Auto-checkpoints run before file edits, or save one in Settings.',
+          source: 'Agent',
+        },
+      ]);
       return;
     }
-    const existing = loadedThreadId
-      ? savedThreads.find((t) => t.id === loadedThreadId)
-      : undefined;
-    let title = existing?.title;
-    if (!existing) {
-      const entered = window.prompt('Thread title (optional):');
-      if (entered === null) return;
-      if (entered.trim()) title = entered.trim();
+    const label = latest.file_count
+      ? `${latest.id} (${latest.file_count} file${latest.file_count === 1 ? '' : 's'})`
+      : latest.id;
+    if (
+      typeof window !== 'undefined' &&
+      !window.confirm(`Revert to latest checkpoint?\n\n${label}${latest.reason ? `\n${latest.reason}` : ''}`)
+    ) {
+      return;
     }
-    const saved = saveAgentThread({
-      id: loadedThreadId,
-      title,
-      cwd,
-      messages,
-    });
-    setLoadedThreadId(saved.id);
-    setSavedFingerprint(agentThreadFingerprint(messages, cwd));
-    refreshSavedThreads();
+    await handleRevert(latest.id);
+  }, [checkpoints]);
+
+  const handleAcceptSelfEdit = useCallback(async (opts?: { force?: boolean }) => {
+    const force = Boolean(opts?.force);
+    if (
+      force &&
+      typeof window !== 'undefined' &&
+      !window.confirm(
+        'Accept these self-edit changes without tests?\n\n' +
+          'Product behavior may be untested. Prefer adding tests when you can.',
+      )
+    ) {
+      return;
+    }
+    setSelfEditReviewBusy(true);
+    try {
+      const out = await acceptSelfEditReview({
+        force,
+        sessionId: selfEditReview?.session_id || undefined,
+      });
+      if (!out.ok) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-self-edit-accept`,
+            role: 'assistant',
+            content: out.message || out.error || 'Accept blocked — tests required.',
+            source: 'Agent',
+            error: true,
+          },
+        ]);
+        if (out.review) setSelfEditReview(out.review);
+        return;
+      }
+      setSelfEditReview(null);
+      setPendingReviews([]);
+      setReviewFileChanges([]);
+      setReviewPanelOpen(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-self-edit-accept`,
+          role: 'assistant',
+          content: force
+            ? 'Self-edit changes accepted (tests override).'
+            : 'Self-edit changes accepted.',
+          source: 'Agent',
+        },
+      ]);
+      await refreshCheckpoints();
+      await refreshSelfEditReview();
+    } finally {
+      setSelfEditReviewBusy(false);
+    }
+  }, [refreshCheckpoints, refreshSelfEditReview, selfEditReview?.session_id]);
+
+  const handleRejectSelfEdit = useCallback(async () => {
+    if (
+      typeof window !== 'undefined' &&
+      !window.confirm('Reject & revert self-edit changes to the pre-edit checkpoint?')
+    ) {
+      return;
+    }
+    setSelfEditReviewBusy(true);
+    try {
+      const out = await rejectSelfEditReview({
+        sessionId: selfEditReview?.session_id || undefined,
+      });
+      const restored = out.restored?.length || 0;
+      const deleted = out.deleted?.length || 0;
+      setSelfEditReview(null);
+      setPendingReviews([]);
+      setReviewFileChanges([]);
+      setReviewPanelOpen(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-self-edit-reject`,
+          role: 'assistant',
+          content: out.ok
+            ? `Self-edit rejected — restored ${restored} file${restored === 1 ? '' : 's'}${
+                deleted ? `, deleted ${deleted} new file${deleted === 1 ? '' : 's'}` : ''
+              }.`
+            : `Reject failed: ${out.error || (out.errors || []).join('; ') || 'unknown error'}`,
+          source: 'Agent',
+          error: !out.ok,
+        },
+      ]);
+      await refreshCheckpoints();
+      await refreshSelfEditReview();
+    } finally {
+      setSelfEditReviewBusy(false);
+    }
+  }, [refreshCheckpoints, refreshSelfEditReview, selfEditReview?.session_id]);
+
+  const handleSaveThread = () => {
+    if (!agentThreadHasContent(messages)) {
+      setThreadSaveNotice('Nothing to save yet — send a message first.');
+      window.setTimeout(() => setThreadSaveNotice(null), 3200);
+      return;
+    }
+    try {
+      const existing = loadedThreadId
+        ? savedThreads.find((t) => t.id === loadedThreadId)
+        : undefined;
+      // Electron often stubs window.prompt → null (which used to abort save). Auto-title instead.
+      const saved = saveAgentThread({
+        id: loadedThreadId,
+        title: existing?.title,
+        cwd,
+        messages,
+        productMode,
+      });
+      rememberAgentWorkspace(cwd);
+      refreshWorkspaceList();
+      setLoadedThreadId(saved.id);
+      setSavedFingerprint(agentThreadFingerprint(messages, cwd, productMode));
+      refreshSavedThreads();
+      setThreadSaveNotice(
+        `Saved ${
+          productMode === 'chat' ? 'chat' : productMode === 'self-edit' ? 'self-edit' : 'code'
+        } thread “${saved.title}”`,
+      );
+      window.setTimeout(() => setThreadSaveNotice(null), 2800);
+    } catch (err) {
+      setThreadSaveNotice(
+        `Could not save thread: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      window.setTimeout(() => setThreadSaveNotice(null), 4200);
+    }
   };
 
   const handleLoadThread = (thread: SavedAgentThread) => {
@@ -1166,11 +2552,6 @@ export function AgentWindow({
       setSavedFingerprint(currentFingerprint);
     }
     refreshSavedThreads();
-  };
-
-  const handleNewThread = () => {
-    if (isDirty && !confirmDiscardUnsaved()) return;
-    resetToNewThread();
   };
 
   const startRenameThread = (thread: SavedAgentThread, e: MouseEvent) => {
@@ -1198,11 +2579,26 @@ export function AgentWindow({
   }${isDirty ? ' · unsaved' : ''}`;
   const terminalStatusText = (() => {
     const last = terminalEntries[0];
-    if (!last) return `Persistent ${terminalShellLabel} session — cwd and env stick across commands.`;
+    if (!last) {
+      return `Persistent ${terminalShellLabel} session — cwd sticks; agent shell tools stream here.`;
+    }
     if (last.running) return `Running: ${last.command}`;
     if (last.result?.ok) return `Last command finished in ${last.result.duration_ms ?? 0} ms.`;
     return 'Last command exited with an error code.';
   })();
+
+  const applyShellInfo = useCallback((info: {
+    shell?: string;
+    shell_label?: string;
+    shells?: AgentShellInfo[];
+  }) => {
+    if (Array.isArray(info.shells) && info.shells.length) setTerminalShells(info.shells);
+    if (info.shell_label) setTerminalShellLabel(info.shell_label);
+    else if (info.shell) {
+      const hit = (info.shells || terminalShells).find((s) => s.id === info.shell);
+      setTerminalShellLabel(hit?.label || info.shell);
+    }
+  }, [terminalShells]);
 
   const threadFileChanges = useMemo(() => {
     const steps: AgentToolStep[] = [];
@@ -1228,16 +2624,53 @@ export function AgentWindow({
     setFooterOpen(true);
     setFooterTab('terminal');
     setTerminalBusy(true);
-    setTerminalEntries((prev) => [{ id, command, cwd: sessionCwd, running: true }, ...prev].slice(0, 40));
+    setTerminalEntries((prev) =>
+      [
+        {
+          id,
+          command,
+          cwd: sessionCwd,
+          running: true,
+          liveStdout: '',
+          source: 'user' as const,
+          shellLabel: terminalShellLabel,
+        },
+        ...prev,
+      ].slice(0, 80),
+    );
     setTerminalCommand('');
     try {
-      const result = await runAgentTerminalCommand({ cwd: sessionCwd, command });
-      if (result.shell) setTerminalShellLabel(result.shell);
+      const result = await runAgentTerminalCommand({
+        cwd: sessionCwd,
+        command,
+        shell: terminalShellId,
+        stream: true,
+        onChunk: (text) => {
+          setTerminalEntries((prev) =>
+            prev.map((entry) =>
+              entry.id === id
+                ? { ...entry, liveStdout: `${entry.liveStdout || ''}${text}` }
+                : entry,
+            ),
+          );
+        },
+      });
+      if (result.shell_label) setTerminalShellLabel(result.shell_label);
+      else if (result.shell) {
+        const hit = terminalShells.find((s) => s.id === result.shell);
+        setTerminalShellLabel(hit?.label || result.shell);
+      }
       if (result.cwd) setTerminalSessionCwd(result.cwd);
       setTerminalEntries((prev) =>
         prev.map((entry) =>
           entry.id === id
-            ? { ...entry, running: false, cwd: result.cwd || entry.cwd, result }
+            ? {
+                ...entry,
+                running: false,
+                liveStdout: undefined,
+                cwd: result.cwd || entry.cwd,
+                result,
+              }
             : entry,
         ),
       );
@@ -1249,11 +2682,12 @@ export function AgentWindow({
             ? {
                 ...entry,
                 running: false,
+                liveStdout: undefined,
                 result: {
                   ok: false,
                   command,
                   cwd: sessionCwd,
-                  stdout: '',
+                  stdout: entry.liveStdout || '',
                   stderr: '',
                   code: null,
                   message,
@@ -1265,35 +2699,85 @@ export function AgentWindow({
     } finally {
       setTerminalBusy(false);
     }
-  }, [cwd, terminalBusy, terminalCommand, terminalSessionCwd]);
+  }, [cwd, terminalBusy, terminalCommand, terminalSessionCwd, terminalShellId, terminalShellLabel, terminalShells]);
 
   const handleResetTerminal = useCallback(async () => {
     const nextCwd = cwd.trim() || defaultAgentProjectRoot();
     setTerminalBusy(true);
     try {
-      const info = await resetAgentTerminal({ cwd: nextCwd });
-      if (info.shell) setTerminalShellLabel(info.shell);
+      const info = await resetAgentTerminal({ cwd: nextCwd, shell: terminalShellId });
+      applyShellInfo(info);
       setTerminalSessionCwd(info.cwd || nextCwd);
-      setTerminalEntries([]);
+      setTerminalEntries((prev) => prev.filter((e) => e.source === 'agent'));
     } catch {
       /* ignore */
     } finally {
       setTerminalBusy(false);
     }
-  }, [cwd]);
+  }, [applyShellInfo, cwd, terminalShellId]);
+
+  const handleTerminalShellChange = useCallback(
+    async (shellId: string) => {
+      if (!shellId || shellId === terminalShellId || terminalBusy) return;
+      setTerminalShellId(shellId);
+      try {
+        localStorage.setItem('butler_agent_terminal_shell', shellId);
+      } catch {
+        /* ignore */
+      }
+      const nextCwd = terminalSessionCwd.trim() || cwd.trim() || defaultAgentProjectRoot();
+      setTerminalBusy(true);
+      try {
+        const info = await resetAgentTerminal({ cwd: nextCwd, shell: shellId });
+        applyShellInfo(info);
+        const hit = terminalShells.find((s) => s.id === shellId);
+        if (hit) setTerminalShellLabel(hit.label);
+      } catch {
+        /* ignore */
+      } finally {
+        setTerminalBusy(false);
+      }
+    },
+    [applyShellInfo, cwd, terminalBusy, terminalSessionCwd, terminalShellId, terminalShells],
+  );
 
   useEffect(() => {
-    void fetchAgentTerminalInfo().then((info) => {
-      if (info.shell) setTerminalShellLabel(info.shell);
-      if (info.cwd) setTerminalSessionCwd(info.cwd);
-    });
+    void Promise.all([fetchAgentTerminalInfo(terminalShellId), fetchAgentTerminalShells()]).then(
+      ([info, shells]) => {
+        if (shells.length) setTerminalShells(shells);
+        applyShellInfo({ ...info, shells: shells.length ? shells : info.shells });
+        if (info.cwd) setTerminalSessionCwd(info.cwd);
+        const preferred = shells.find((s) => s.id === terminalShellId && s.available);
+        if (!preferred) {
+          const fallback =
+            shells.find((s) => s.id === 'pwsh' && s.available) ||
+            shells.find((s) => s.id === 'powershell' && s.available) ||
+            shells.find((s) => s.available);
+          if (fallback && fallback.id !== terminalShellId) {
+            setTerminalShellId(fallback.id);
+            setTerminalShellLabel(fallback.label);
+            try {
+              localStorage.setItem('butler_agent_terminal_shell', fallback.id);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- boot once
   }, []);
 
   useEffect(() => {
     setTerminalSessionCwd(cwd.trim() || defaultAgentProjectRoot());
-    void resetAgentTerminal({ cwd: cwd.trim() || defaultAgentProjectRoot() }).then((info) => {
-      if (info.shell) setTerminalShellLabel(info.shell);
+    void resetAgentTerminal({
+      cwd: cwd.trim() || defaultAgentProjectRoot(),
+      shell: terminalShellId,
+    }).then((info) => {
+      applyShellInfo(info);
     });
+    // Intentionally omit terminalShellId — shell changes use handleTerminalShellChange.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cwd]);
 
   const onSidebarResizeStart = useCallback((e: MouseEvent<HTMLDivElement>) => {
@@ -1352,6 +2836,11 @@ export function AgentWindow({
     if (!sending) return;
     const textToRestore = input.trim() || cancelledMessageRef.current || '';
     setCancelRequested(true);
+    try {
+      chatAbortRef.current?.abort();
+    } catch {
+      /* */
+    }
     setSending(false);
     setRunStatus(null);
     setLiveSteps([]);
@@ -1414,12 +2903,21 @@ export function AgentWindow({
       ref={rootRef}
       className={`agent-window agent-window--theme-${theme.mode} agent-window--accent-${theme.accent}${
         embedded ? ' agent-window--embedded' : ''
-      }${splitView ? ' agent-window--split' : ''}${browserMaximized ? ' agent-window--browser-maximized' : ''}`}
+      }${splitView ? ' agent-window--split' : ''}${
+        effectiveVoiceMode ? ' agent-window--voice-mode' : ''
+      }${
+        effectiveVoiceMode && localSpeaking
+          ? ' agent-window--voice-speaking'
+          : effectiveVoiceMode && (localUserSpeaking || micLevel > 0.12)
+            ? ' agent-window--voice-user'
+            : effectiveVoiceMode && effectiveVoiceAlive
+              ? ' agent-window--voice-alive'
+              : ''
+      }`}
       data-agent-theme={theme.mode}
       data-agent-accent={theme.accent}
     >
-      {!browserMaximized ? (
-        <AgentSidebar
+      <AgentSidebar
           open={sidebarOpen}
           widthPx={sidebarWidthPx}
           sidebarRef={sidebarRef}
@@ -1428,13 +2926,20 @@ export function AgentWindow({
           onThreadSearchChange={setThreadSearch}
           searchOpen={searchOpen}
           onToggleSearch={() => setSearchOpen((v) => !v)}
+          workspaces={sidebarWorkspaces}
+          activeCwd={cwd}
+          expandedWorkspaces={expandedWorkspaces}
+          onToggleWorkspaceExpand={handleToggleWorkspaceExpand}
+          onSelectWorkspace={(path) => void handleSelectWorkspace(path)}
+          onAddWorkspace={() => void handleAddWorkspace()}
+          onNewThreadInWorkspace={(path) => void handleNewThreadInWorkspace(path)}
           savedThreads={savedThreads}
           loadedThreadId={loadedThreadId}
           editingTitleId={editingTitleId}
           editingTitleValue={editingTitleValue}
           onEditingTitleValueChange={setEditingTitleValue}
-          onNewThread={handleNewThread}
           onOpenMcp={() => setMcpOpen(true)}
+          onOpenSpotify={() => setSpotifyOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onCloseSidebar={() => setSidebarOpen(false)}
           onSecretLogoDoubleClick={onSecretLogoDoubleClick}
@@ -1448,8 +2953,18 @@ export function AgentWindow({
           onDeleteThread={handleDeleteThread}
           onSaveThread={handleSaveThread}
           canSave={agentThreadHasContent(messages)}
+          saveNotice={threadSaveNotice}
           sending={sending}
           mcpCount={mcpCount}
+          pendingReviews={pendingReviews}
+          activeReviewId={
+            selfEditReview?.review_id ||
+            selfEditReview?.session_id ||
+            selfEditReview?.checkpoint_id ||
+            selfEditReview?.run_id ||
+            null
+          }
+          onSelectReview={handleSelectReview}
           embedded={embedded}
           splitView={splitView}
           onBack={onBack}
@@ -1459,8 +2974,7 @@ export function AgentWindow({
           onPopOut={onPopOut}
           onPopIn={onPopIn}
         />
-      ) : null}
-      {sidebarOpen && !browserMaximized ? (
+      {sidebarOpen ? (
         <div
           className="agent-window-resize-handle agent-window-resize-handle--vertical"
           role="separator"
@@ -1476,8 +2990,20 @@ export function AgentWindow({
       ) : null}
 
       <div className="agent-window-main">
-        {!browserMaximized ? (
-          <div className="agent-chrome">
+        {effectiveVoiceMode ? (
+          <div className="agent-window__voice-aura" aria-hidden>
+            <span className="agent-window__voice-aura-wash agent-window__voice-aura-wash--butler">
+              <span className="agent-window__voice-aura-bloom" />
+            </span>
+            <span className="agent-window__voice-aura-wash agent-window__voice-aura-wash--mid">
+              <span className="agent-window__voice-aura-bloom" />
+            </span>
+            <span className="agent-window__voice-aura-wash agent-window__voice-aura-wash--user">
+              <span className="agent-window__voice-aura-bloom" />
+            </span>
+          </div>
+        ) : null}
+        <div className="agent-chrome">
           {!sidebarOpen ? (
             <button
               type="button"
@@ -1523,24 +3049,50 @@ export function AgentWindow({
             >
               Code
             </button>
-          </div>
-          <div className="agent-chrome-meta">
-            <span className="agent-chrome-path" title={cwd}>
-              {productMode === 'code' ? workspaceSummary : 'Butler conversation'}
-            </span>
             <button
               type="button"
-              className="agent-chrome-model"
-              title={productMode === 'chat' ? 'Conversational Butler' : selectedProviderMeta.hint}
-              onClick={() => setSettingsOpen(true)}
+              role="tab"
+              aria-selected={productMode === 'self-edit'}
+              className={`agent-mode-tab agent-mode-tab--self-edit${
+                productMode === 'self-edit' ? ' agent-mode-tab--active' : ''
+              }`}
+              onClick={() => setProductModePersist('self-edit')}
+              title="Edit Butler's own repo (enables self-edit + Accept/Reject)"
             >
-              {productMode === 'chat'
-                ? activeModelLabel || 'Butler'
-                : activeModelLabel || selectedProviderMeta.label}
+              Self-edit
             </button>
+          </div>
+          <div className="agent-chrome-meta">
+            {isCodingProductMode(productMode) ? (
+              <span className="agent-chrome-path" title={cwd}>
+                {productMode === 'self-edit' ? `Self-edit · ${workspaceSummary}` : workspaceSummary}
+              </span>
+            ) : null}
             {isDirty ? <span className="agent-window-unsaved-label">Unsaved</span> : null}
           </div>
           <div className="agent-chrome-actions">
+            <button
+              type="button"
+              className="agent-window-btn agent-window-btn--ghost agent-window-btn--sm"
+              onClick={() => void handleRevertLastCheckpoint()}
+              disabled={sending || checkpointBusy || checkpoints.length === 0}
+              title={
+                checkpoints[0]
+                  ? `Revert to latest checkpoint (${checkpoints[0].id})`
+                  : 'No checkpoints yet'
+              }
+            >
+              Revert
+            </button>
+            <button
+              type="button"
+              className="agent-window-btn agent-window-btn--ghost agent-window-btn--sm"
+              onClick={() => void triggerDesktopRebuild(true)}
+              disabled={rebuildBusy}
+              title="Fast rebuild: vite build + patch dist-desktop app.asar"
+            >
+              {rebuildBusy ? 'Rebuild…' : 'Rebuild'}
+            </button>
             {!sidebarOpen && embedded ? (
               <>
                 {onEnterSplit || onExitSplit ? (
@@ -1565,10 +3117,9 @@ export function AgentWindow({
               </>
             ) : null}
           </div>
-          </div>
-        ) : null}
+        </div>
 
-        {!browserMaximized && sending && runStatus ? (
+        {sending && runStatus ? (
           <div className="agent-window-working-banner" role="status" aria-live="polite">
             <span className="agent-pulse" aria-hidden />
             <div className="agent-window-working-text">
@@ -1584,9 +3135,33 @@ export function AgentWindow({
           </div>
         ) : null}
 
-        {!browserMaximized ? (
-          <div className="agent-window-thread-wrap">
-            {sending && liveTodos.length > 0 ? <AgentTodoList todos={liveTodos} floating /> : null}
+        <div className="agent-window-thread-wrap">
+            {effectiveVoiceMode ? (
+              <>
+                {sending && liveTodos.length > 0 ? (
+                  <AgentTodoPanel todos={liveTodos} steps={liveSteps} />
+                ) : null}
+                <VoiceConversationStage
+                  micLevel={effectiveMicMuted ? 0 : micLevel}
+                  userSpeaking={
+                    !effectiveMicMuted && !localSpeaking && (localUserSpeaking || micLevel > 0.12)
+                  }
+                  butlerSpeaking={localSpeaking}
+                  thinking={sending && !localSpeaking}
+                  micMuted={effectiveMicMuted}
+                  pulseColors={pulseColors}
+                  onEnd={() => handleToggleVoiceMode()}
+                />
+              </>
+            ) : (
+              <>
+            {sending && liveTodos.length > 0 ? <AgentTodoPanel todos={liveTodos} steps={liveSteps} /> : null}
+            {sending && isCodingProductMode(productMode) && (
+              <div className="agent-window-coding-banner" role="status" aria-live="polite">
+                <span className="agent-window-coding-spinner" aria-hidden />
+                <span>Coding…</span>
+              </div>
+            )}
             <div
               ref={threadScrollRef}
               className="agent-window-thread"
@@ -1600,7 +3175,9 @@ export function AgentWindow({
                 className={`agent-msg agent-msg--${m.role}${m.error ? ' agent-msg--error' : ''}`}
               >
                 <div className="agent-msg-meta">
-                  <span className="agent-msg-role">{m.role === 'user' ? 'You' : 'Agent'}</span>
+                  <span className="agent-msg-role">
+                    {m.role === 'user' ? 'You' : productMode === 'chat' ? 'Butler' : 'Agent'}
+                  </span>
                   {m.source ? <span className="agent-msg-source">{m.source}</span> : null}
                 </div>
                 <div className="agent-msg-body">
@@ -1624,7 +3201,7 @@ export function AgentWindow({
                   {m.role === 'assistant' &&
                   !m.error &&
                   !sending &&
-                  productMode === 'code' &&
+                  isCodingProductMode(productMode) &&
                   (m.needsContinue || looksLikeIncompleteAgentReply(m.content, m.steps)) &&
                   m.id ===
                     [...messages].reverse().find((x) => x.role === 'assistant' && !x.error)?.id ? (
@@ -1679,32 +3256,25 @@ export function AgentWindow({
             ) : null}
               <div ref={threadEndRef} />
             </div>
+              </>
+            )}
           </div>
-        ) : null}
 
-        {!browserMaximized ? (
+        {!effectiveVoiceMode ? (
           <footer className="agent-window-composer">
-            <AgentFileDiffStrip changes={threadFileChanges} onOpen={setActiveDiff} />
-            <div className="agent-window-composer-main">
-            <textarea
-              ref={inputRef}
-              className="agent-window-input"
-              rows={3}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={
-                productMode === 'chat'
-                  ? 'Ask Butler anything…'
-                  : 'Ask to scan the project, edit code, run tests, search docs…'
-              }
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  void handleSend();
-                }
-              }}
-              disabled={sending}
-            />
+            {selfEditReview ? (
+              <SelfEditReviewBanner
+                review={selfEditReview}
+                changes={threadFileChanges}
+                busy={selfEditReviewBusy || checkpointBusy || sending}
+                overrideTestsDefault={acceptWithoutTests}
+                onOpenDiff={setActiveDiff}
+                onAccept={(opts) => void handleAcceptSelfEdit(opts)}
+                onReject={() => void handleRejectSelfEdit()}
+              />
+            ) : (
+              <AgentFileDiffStrip changes={threadFileChanges} onOpen={setActiveDiff} />
+            )}
             {speechStatusText ? (
               <div
                 className={`agent-window-speech-status${
@@ -1714,6 +3284,29 @@ export function AgentWindow({
                 aria-live="polite"
               >
                 {speechStatusText}
+              </div>
+            ) : null}
+            {screenSharing || screenShareError ? (
+              <div
+                className={`agent-window-screen-status${
+                  screenShareError ? ' agent-window-screen-status--error' : ''
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                <span className="agent-window-screen-status-dot" aria-hidden />
+                <span className="agent-window-screen-status-label">
+                  {screenShareError
+                    ? screenShareError
+                    : 'Sharing screen — Butler sees each message'}
+                </span>
+                <button
+                  type="button"
+                  className="agent-window-screen-status-stop"
+                  onClick={() => void stopScreenShare()}
+                >
+                  Stop
+                </button>
               </div>
             ) : null}
             {messageQueue.length > 0 ? (
@@ -1727,111 +3320,299 @@ export function AgentWindow({
                 ))}
               </div>
             ) : null}
-          </div>
-          <div className="agent-window-composer-actions">
-            {sending ? (
-              <button
-                type="button"
-                className="agent-window-btn agent-window-btn--ghost agent-window-btn--sm"
-                onClick={() => void handleCancelSend()}
-              >
-                Cancel
-              </button>
+            {chatAttachment ? (
+              <div className="agent-window-attach-chip" title={chatAttachment.name}>
+                {chatAttachment.mime.toLowerCase().startsWith('image/') ? (
+                  <img src={chatAttachment.dataUrl} alt="" className="agent-window-attach-thumb" />
+                ) : null}
+                <span className="agent-window-attach-name">{chatAttachment.name}</span>
+                <button
+                  type="button"
+                  className="agent-window-attach-clear"
+                  onClick={() => setChatAttachment(null)}
+                  aria-label="Remove attachment"
+                >
+                  ×
+                </button>
+              </div>
             ) : null}
-            {!sending && showContinue ? (
-              <button
-                type="button"
-                className="agent-window-btn agent-window-btn--continue"
-                onClick={() => void handleContinue()}
-                title="Resume the agent to finish promised work"
-              >
-                Continue
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className={`agent-window-btn agent-window-btn--ghost agent-window-speech-btn${
-                speechState === 'listening' ? ' agent-window-speech-btn--active' : ''
-              }`}
-              onClick={() => void handleSpeechToggle()}
-              disabled={sending || speechState === 'transcribing'}
-              title={
-                speechState === 'listening'
-                  ? 'Stop recording and transcribe'
-                  : speechState === 'transcribing'
-                    ? 'Transcribing speech'
-                    : 'Record speech-to-text'
-              }
-              aria-pressed={speechState === 'listening'}
-              aria-label={
-                speechState === 'listening'
-                  ? 'Stop recording and transcribe'
-                  : 'Start speech-to-text recording'
-              }
+            <div
+              className={`agent-window-composer-row${composerDragOver ? ' agent-window-composer-row--drag' : ''}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setComposerDragOver(true);
+              }}
+              onDragLeave={() => setComposerDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setComposerDragOver(false);
+                const f = e.dataTransfer?.files?.[0];
+                if (!f) return;
+                void fileToChatAttach(f).then((att) => {
+                  if (att) setChatAttachment(att);
+                });
+              }}
             >
-              <span
-                className={`agent-window-speech-indicator${
-                  speechState === 'listening' ? ' agent-window-speech-indicator--live' : ''
-                }`}
-                aria-hidden
+              <input
+                ref={chatFileInputRef}
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  void fileToChatAttach(f).then((att) => {
+                    if (att) setChatAttachment(att);
+                  });
+                  e.target.value = '';
+                }}
               />
-              {speechState === 'listening'
-                ? 'Stop mic'
-                : speechState === 'transcribing'
-                  ? 'Transcribing…'
-                  : 'Dictate'}
-            </button>
-            {speechState === 'listening' ? (
               <button
                 type="button"
-                className="agent-window-btn agent-window-btn--ghost agent-window-btn--sm"
-                onClick={() => void handleSpeechCancel()}
+                className="agent-composer-icon-btn agent-composer-icon-btn--attach"
+                onClick={() => chatFileInputRef.current?.click()}
+                disabled={sending}
+                title="Attach image (or paste / drop)"
+                aria-label="Attach image"
               >
-                Cancel
+                📎
               </button>
-            ) : null}
-            <button
-              type="button"
-              className="agent-window-send"
-              onClick={() => void handleSend()}
-              disabled={sending || !input.trim()}
-            >
-              {sending ? 'Working…' : productMode === 'chat' ? 'Send' : 'Send'}
-            </button>
+              <button
+                type="button"
+                className={`agent-composer-icon-btn agent-composer-icon-btn--screen${
+                  screenSharing ? ' agent-composer-icon-btn--screen-on' : ''
+                }`}
+                onClick={() => handleToggleScreenShare()}
+                disabled={sending || screenShareBusy}
+                title={
+                  screenSharing
+                    ? 'Stop sharing screen'
+                    : 'Share screen — every message includes what you see (no preview)'
+                }
+                aria-pressed={screenSharing}
+                aria-label={screenSharing ? 'Stop sharing screen' : 'Share screen'}
+              >
+                {screenShareBusy ? '…' : 'Share'}
+              </button>
+              <textarea
+                ref={inputRef}
+                className="agent-window-input"
+                rows={2}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={
+                  screenSharing
+                    ? 'Ask about what’s on your screen…'
+                    : productMode === 'chat'
+                      ? 'Ask Butler anything… (paste or drop images)'
+                      : productMode === 'self-edit'
+                        ? 'Ask Butler to change his own code… (Accept/Reject after writes)'
+                        : 'Ask to scan the project, edit code, run tests, search docs…'
+                }
+                onPaste={(e) => {
+                  const items = e.clipboardData?.items;
+                  if (!items) return;
+                  for (const item of Array.from(items)) {
+                    if (!item.type.startsWith('image/')) continue;
+                    e.preventDefault();
+                    const f = item.getAsFile();
+                    if (!f) continue;
+                    void fileToChatAttach(f).then((att) => {
+                      if (att) setChatAttachment(att);
+                    });
+                    break;
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleSend();
+                  }
+                }}
+                disabled={sending}
+              />
+              <div className="agent-window-composer-actions">
+                {sending ? (
+                  <button
+                    type="button"
+                    className="agent-composer-icon-btn"
+                    onClick={() => void handleCancelSend()}
+                    title="Cancel"
+                    aria-label="Cancel"
+                  >
+                    ✕
+                  </button>
+                ) : null}
+                {!sending && showContinue ? (
+                  <button
+                    type="button"
+                    className="agent-composer-icon-btn agent-composer-icon-btn--accent"
+                    onClick={() => void handleContinue()}
+                    title="Resume the agent to finish promised work"
+                  >
+                    →
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className={`agent-composer-icon-btn agent-composer-icon-btn--speech${
+                    speechState === 'listening' ? ' agent-composer-icon-btn--active' : ''
+                  }`}
+                  onClick={() => void handleSpeechToggle()}
+                  disabled={sending || speechState === 'transcribing'}
+                  title={
+                    speechState === 'listening'
+                      ? 'Stop recording and transcribe'
+                      : speechState === 'transcribing'
+                        ? 'Transcribing speech'
+                        : 'Record speech-to-text'
+                  }
+                  aria-pressed={speechState === 'listening'}
+                  aria-label={
+                    speechState === 'listening'
+                      ? 'Stop recording and transcribe'
+                      : speechState === 'transcribing'
+                        ? 'Transcribing speech'
+                        : 'Start speech-to-text recording'
+                  }
+                >
+                  {speechState === 'transcribing' ? '…' : '🎤'}
+                </button>
+                <button
+                  type="button"
+                  className="agent-composer-icon-btn agent-composer-icon-btn--send"
+                  onClick={() => void handleSend()}
+                  disabled={
+                    sending || (!input.trim() && !chatAttachment && !latestScreenAttach())
+                  }
+                  title={sending ? 'Working…' : 'Send'}
+                  aria-label={sending ? 'Working' : 'Send'}
+                >
+                  {sending ? '…' : '↑'}
+                </button>
+                <button
+                  type="button"
+                  className={`agent-composer-icon-btn agent-voice-wave-btn${
+                    effectiveVoiceMode ? ' agent-voice-wave-btn--active' : ''
+                  }${
+                    effectiveVoiceMode && effectiveVoiceAlive ? ' agent-voice-wave-btn--alive' : ''
+                  }${effectiveVoiceMode && effectiveMicMuted ? ' agent-voice-wave-btn--muted' : ''}`}
+                  onClick={() => handleWaveformClick()}
+                  disabled={effectiveVoiceToggleBusy}
+                  title={
+                    !effectiveVoiceMode
+                      ? 'Voice conversation — speak with Butler (Chat)'
+                      : effectiveMicMuted
+                        ? 'Unmute microphone'
+                        : 'Mute microphone'
+                  }
+                  aria-pressed={effectiveVoiceMode && !effectiveMicMuted}
+                  aria-label={
+                    !effectiveVoiceMode
+                      ? 'Start voice conversation'
+                      : effectiveMicMuted
+                        ? 'Unmute microphone'
+                        : 'Mute microphone'
+                  }
+                >
+                  <span className="agent-voice-wave-btn__bars" aria-hidden>
+                    {waveBarHeights.map((h, i) => (
+                      <span
+                        key={i}
+                        className="agent-voice-wave-btn__bar"
+                        style={{ ['--bar-h' as string]: h }}
+                      />
+                    ))}
+                  </span>
+                </button>
+              </div>
             </div>
           </footer>
         ) : null}
 
+        {effectiveVoiceMode ? (
+          <footer className="agent-window-composer agent-window-composer--voice-only">
+            {screenSharing || screenShareError ? (
+              <div
+                className={`agent-window-screen-status${
+                  screenShareError ? ' agent-window-screen-status--error' : ''
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                <span className="agent-window-screen-status-dot" aria-hidden />
+                <span className="agent-window-screen-status-label">
+                  {screenShareError
+                    ? screenShareError
+                    : 'Sharing screen — each voice turn includes it'}
+                </span>
+                <button
+                  type="button"
+                  className="agent-window-screen-status-stop"
+                  onClick={() => void stopScreenShare()}
+                >
+                  Stop
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="agent-window-btn agent-window-btn--ghost agent-window-btn--sm"
+                onClick={() => handleToggleScreenShare()}
+                disabled={screenShareBusy}
+                title="Share screen for this voice session"
+              >
+                {screenShareBusy ? 'Starting…' : 'Share screen'}
+              </button>
+            )}
+            <button
+              type="button"
+              className={`agent-composer-icon-btn agent-voice-wave-btn agent-voice-wave-btn--active${
+                effectiveVoiceAlive ? ' agent-voice-wave-btn--alive' : ''
+              }${effectiveMicMuted ? ' agent-voice-wave-btn--muted' : ''}`}
+              onClick={() => handleWaveformClick()}
+              disabled={effectiveVoiceToggleBusy}
+              title={effectiveMicMuted ? 'Unmute microphone' : 'Mute microphone'}
+              aria-pressed={!effectiveMicMuted}
+              aria-label={effectiveMicMuted ? 'Unmute microphone' : 'Mute microphone'}
+            >
+              <span className="agent-voice-wave-btn__bars" aria-hidden>
+                {waveBarHeights.map((h, i) => (
+                  <span
+                    key={i}
+                    className="agent-voice-wave-btn__bar"
+                    style={{ ['--bar-h' as string]: h }}
+                  />
+                ))}
+              </span>
+            </button>
+          </footer>
+        ) : null}
+
+        {effectiveVoiceMode ? (
+          <span className="agent-window__voice-aura-floor" aria-hidden>
+            <span className="agent-window__voice-aura-floor-wash agent-window__voice-aura-floor-wash--butler" />
+            <span className="agent-window__voice-aura-floor-wash agent-window__voice-aura-floor-wash--mid" />
+            <span className="agent-window__voice-aura-floor-wash agent-window__voice-aura-floor-wash--user" />
+          </span>
+        ) : null}
+
         <AgentBottomPanel
-          open={browserMaximized ? true : footerOpen}
+          open={footerOpen}
           heightPx={footerHeightPx}
           tab={footerTab}
-          browserMaximized={browserMaximized}
           onTabChange={(tab) => openFooterTab(tab)}
           onToggleOpen={() => {
-            if (browserMaximized) {
-              setBrowserMaximized(false);
-              return;
-            }
-            setFooterOpen((open) => {
-              const next = !open;
-              if (next && footerTab === 'browser') {
-                setFooterHeightPx((prev) =>
-                  prev < AGENT_FOOTER_BROWSER_DEFAULT_PX ? AGENT_FOOTER_BROWSER_DEFAULT_PX : prev,
-                );
-              }
-              return next;
-            });
+            setFooterOpen((open) => !open);
           }}
-          onToggleBrowserMaximized={toggleBrowserMaximized}
+
           onResizeStart={onFooterResizeStart}
-          onResetHeight={() =>
-            setFooterHeightPx(
-              footerTab === 'browser' ? AGENT_FOOTER_BROWSER_DEFAULT_PX : AGENT_FOOTER_DEFAULT_PX,
-            )
-          }
+          onResetHeight={() => setFooterHeightPx(AGENT_FOOTER_DEFAULT_PX)}
           cwd={terminalSessionCwd || cwd}
           terminalShellLabel={terminalShellLabel}
+          terminalShellId={terminalShellId}
+          terminalShells={terminalShells}
+          onTerminalShellChange={(id) => void handleTerminalShellChange(id)}
           terminalStatusText={terminalStatusText}
           terminalCommand={terminalCommand}
           onTerminalCommandChange={setTerminalCommand}
@@ -1847,7 +3628,10 @@ export function AgentWindow({
 
         <AgentSettingsPanel
           open={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => {
+            setPulseColors(loadPulseColors());
+            setSettingsOpen(false);
+          }}
           cwd={cwd}
           onCwdChange={(next) => {
             setCwd(next);
@@ -1869,8 +3653,23 @@ export function AgentWindow({
           sending={sending}
           onManualCheckpoint={() => void handleManualCheckpoint()}
           onRevertCheckpoint={(id) => void handleRevert(id)}
+          onRevertLastCheckpoint={() => void handleRevertLastCheckpoint()}
+          onRebuildDesktop={() => void triggerDesktopRebuild(true)}
+          rebuildBusy={rebuildBusy}
           theme={theme}
           onThemeChange={handleThemeChange}
+          productMode={productMode}
+          onProductModeChange={setProductModePersist}
+          acceptWithoutTests={acceptWithoutTests}
+          onAcceptWithoutTestsChange={(on) => {
+            writeAcceptWithoutTestsPref(on);
+            setAcceptWithoutTests(on);
+          }}
+          screenLookMode={screenLookMode}
+          onScreenLookModeChange={(on) => {
+            setScreenLookModeEnabled(on);
+            setScreenLookMode(on);
+          }}
         />
 
         <AgentUtilityPanel
@@ -1885,6 +3684,8 @@ export function AgentWindow({
           onClose={() => setMcpOpen(false)}
           onServersChanged={(servers) => setMcpCount(servers.length)}
         />
+
+        <AgentSpotifyPanel open={spotifyOpen} onClose={() => setSpotifyOpen(false)} />
       </div>
     </div>
   );

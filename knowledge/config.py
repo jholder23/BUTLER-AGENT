@@ -88,10 +88,26 @@ def _env_flag(name: str) -> bool:
 
 
 OPENAI_API_KEY = "" if _env_flag("BUTLER_LOCAL_ONLY") else (os.getenv("OPENAI_API_KEY", "") or "").strip()
-LOCAL_MODEL = os.getenv("LOCAL_MODEL", "pepee")
+# One lightweight uncensored Ollama model for Butler chat + Agent local fallback (qwen etc. stay on disk unused).
+LOCAL_MODEL = (os.getenv("LOCAL_MODEL") or "dolphin-llama3:8b").strip() or "dolphin-llama3:8b"
 LOCAL_AGENT_MODEL = (
-    (os.getenv("LOCAL_AGENT_MODEL") or os.getenv("BUTLER_AGENT_MODEL") or "qwen2.5:7b-instruct")
-).strip()
+    (os.getenv("LOCAL_AGENT_MODEL") or os.getenv("BUTLER_AGENT_MODEL") or LOCAL_MODEL or "dolphin-llama3:8b")
+).strip() or LOCAL_MODEL
+# Compact Ollama VLM for image Q&A (describe / what's in this). Not used for Comfy img2img.
+LOCAL_VISION_MODEL = (os.getenv("LOCAL_VISION_MODEL") or "moondream").strip() or "moondream"
+
+
+def _env_flag_default_on(name: str) -> bool:
+    """True when unset or explicitly on; False only when set to 0/false/off."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if raw == "":
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+# Desktop VRAM trim defaults: video (Wan) + MusicGen off unless explicitly re-enabled (=0).
+BUTLER_DISABLE_VIDEO = _env_flag_default_on("BUTLER_DISABLE_VIDEO")
+BUTLER_DISABLE_MUSICGEN = _env_flag_default_on("BUTLER_DISABLE_MUSICGEN")
 # Agent window provider: local (default) | gemini | groq | openrouter | mistral | cohere
 BUTLER_AGENT_PROVIDER = (os.getenv("BUTLER_AGENT_PROVIDER") or "local").strip().lower()
 # Per-provider API keys for Agent cloud models (agent path only — not regular /chat)
@@ -100,6 +116,10 @@ GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
 MISTRAL_API_KEY = (os.getenv("MISTRAL_API_KEY") or "").strip()
 COHERE_API_KEY = (os.getenv("COHERE_API_KEY") or "").strip()
+# Spotify Web API (SEO playlists). Create an app at https://developer.spotify.com/dashboard
+SPOTIFY_CLIENT_ID = (os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
+SPOTIFY_CLIENT_SECRET = (os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip()
+SPOTIFY_REDIRECT_URI = (os.getenv("SPOTIFY_REDIRECT_URI") or "http://127.0.0.1:4389/callback").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PEEPEEDEE_AI_URL = os.getenv("BUTLOR_AI_URL") or os.getenv("PEEPEEDEE_AI_URL", "http://localhost:5000")
 

@@ -38,6 +38,13 @@ ALLOWED_ROUTES = frozenset(
         "sd_txt2video",
         "print3d",
         "sound_musicgen",
+        "spotify_seo_create",
+        "spotify_seo_maintain",
+        "spotify_seo_cycle",
+        "spotify_seo_status",
+        "artist_project_show",
+        "artist_project_update",
+        "artist_project_sync",
     }
 )
 
@@ -62,6 +69,13 @@ TOOL_ROUTES = frozenset(
         "sd_txt2video",
         "print3d",
         "sound_musicgen",
+        "spotify_seo_create",
+        "spotify_seo_maintain",
+        "spotify_seo_cycle",
+        "spotify_seo_status",
+        "artist_project_show",
+        "artist_project_update",
+        "artist_project_sync",
     }
 )
 
@@ -422,6 +436,10 @@ def classify_semantic_route(
         "- Use `sd_image2video` when they want to animate a **specific uploaded/last image** locally.\n"
         "- Use `print3d` only when they want a physical 3D-printable model (STL/mesh).\n"
         "- Use `sound_musicgen` for music/jingle/sfx they want generated as audio.\n"
+        "- Use `spotify_seo_*` only when they want Spotify SEO playlists created/maintained to promote "
+        "their songs (not MusicGen, not watching Spotify in a browser).\n"
+        "- Use `artist_project_*` when they want to show/update/sync their music artist project profile "
+        "(genres, bio, tracks, niches) that feeds SEO playlists.\n"
         "- If they mix goals, prefer `chat` with empty clarify unless one tool goal clearly dominates.\n"
     )
     user_blob = hist + f"Latest user message:\n{um[:12000]}"

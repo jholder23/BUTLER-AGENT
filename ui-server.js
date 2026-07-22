@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
-import { mkdir, writeFile, readdir, readFile, stat, realpath } from 'fs/promises';
+import { mkdir, writeFile, readdir, readFile, stat, realpath, unlink, rm } from 'fs/promises';
 import {
   existsSync,
   readFileSync,
@@ -14,6 +14,7 @@ import {
   writeSync,
   readdirSync,
   createReadStream,
+  statSync,
 } from 'fs';
 import { exec as cpExec, execSync, spawn } from 'child_process';
 import { promisify } from 'util';
@@ -29,6 +30,15 @@ import { getButlorConfigDirAbs, getDefaultButlorRoot } from './butlor-data-root.
 
 const require = createRequire(import.meta.url);
 const { readDesktopRbBase64Sync } = require('./desktop-rb-helper.cjs');
+const {
+  BUILTIN_WORKFLOW_KNOBS,
+  knobsFromBalance,
+  cleanWorkflowKnobs,
+  knobsForNamedOrBalance,
+  sanitizeWorkflowPresetName,
+  isPlausibleWorkflowPresetName,
+  workflowPresetNameForResult,
+} = require('./easy-img2img-workflow-presets.cjs');
 import {
   runPrint3dOpenScadPipeline,
   runPrint3dChatPipeline,
@@ -68,6 +78,7 @@ import {
 } from './agent-env.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const { registerDeviceDiagnosticsRoutes } = require('./device-diagnostics-api.cjs');
 {
   const envFile = path.join(__dirname, '.env');
   dotenv.config({ path: envFile });
@@ -97,18 +108,18 @@ const KNOWLEDGE_API_URL = normalizeKnowledgeApiBaseUrl(process.env.KNOWLEDGE_API
   logPrefix: '[ui-server] ',
 });
 
-/** Same base as KNOWLEDGE_API_URL — used for fetch() to Python api_server (/chat, /sd/*, …). */
+/** Same base as KNOWLEDGE_API_URL ? used for fetch() to Python api_server (/chat, /sd/*, ?). */
 const LOCAL_AI_URL = KNOWLEDGE_API_URL;
 
 /**
- * POST /chat waits on Knowledge end-to-end: multiple POSTs to localhost:5000 (LM) plus Python work — can exceed ~5 minutes.
- * Override with BUTLER_UI_CHAT_TIMEOUT_MS (must be >= 45s; max 2h). Should stay ≥ Knowledge’s peepee timeouts × stacked hops.
+ * POST /chat waits on Knowledge end-to-end: multiple POSTs to localhost:5000 (LM) plus Python work ? can exceed ~5 minutes.
+ * Override with BUTLER_UI_CHAT_TIMEOUT_MS (must be >= 45s; max 2h). Should stay ? Knowledge?s peepee timeouts � stacked hops.
  */
 function getUiChatFetchTimeoutMs() {
   const raw = String(process.env.BUTLER_UI_CHAT_TIMEOUT_MS || '').trim();
   const n = raw ? Number.parseInt(raw, 10) : NaN;
   if (Number.isFinite(n) && n >= 45_000) return Math.min(n, 7_200_000);
-  // Default: 14m — room for ~2 heavy LM calls + enrichment without AbortSignal killing the POST first.
+  // Default: 14m ? room for ~2 heavy LM calls + enrichment without AbortSignal killing the POST first.
   return 840_000;
 }
 
@@ -146,7 +157,7 @@ function explainKnowledgeFetchFailure(err) {
       status: 504,
       error: 'knowledge_slow',
       message:
-        'The Knowledge API did not send a full response in time. That usually means the **local LLM** (default port 5000) is still loading, hung, or restarted — not a missing file on disk. Check Status → local_llm, wait for the model to finish loading, or raise BUTLER_UI_CHAT_TIMEOUT_MS (and BUTLER_PEEPEE_HTTP_TIMEOUT_SEC on the Knowledge process).',
+        'The Knowledge API did not send a full response in time. That usually means the **local LLM** (default port 5000) is still loading, hung, or restarted ? not a missing file on disk. Check Status ? local_llm, wait for the model to finish loading, or raise BUTLER_UI_CHAT_TIMEOUT_MS (and BUTLER_PEEPEE_HTTP_TIMEOUT_SEC on the Knowledge process).',
     };
   }
   if (
@@ -166,7 +177,7 @@ function explainKnowledgeFetchFailure(err) {
     return {
       status: 504,
       error: 'chat_timeout',
-      message: `The chat request hit the wait limit (AbortSignal after ${getUiChatFetchTimeoutMs()} ms). Set BUTLER_UI_CHAT_TIMEOUT_MS on ui-server (≥45000, e.g. 600000 for 10 min) or shorten the task. Also raise BUTLER_PEEPEE_HTTP_TIMEOUT_SEC on Knowledge if the local LLM stalls mid-request.`,
+      message: `The chat request hit the wait limit (AbortSignal after ${getUiChatFetchTimeoutMs()} ms). Set BUTLER_UI_CHAT_TIMEOUT_MS on ui-server (?45000, e.g. 600000 for 10 min) or shorten the task. Also raise BUTLER_PEEPEE_HTTP_TIMEOUT_SEC on Knowledge if the local LLM stalls mid-request.`,
     };
   }
   if (/timeout|timed out/i.test(msg) && !/HeadersTimeoutError/i.test(String(causeName))) {
@@ -219,7 +230,7 @@ function safePrint3dStlQueryName(name) {
 
 /**
  * Knowledge API may be an older build without `print3d` in /butlor/data_summary; inject the row
- * so Settings → Data folder always lists the 3D print directory.
+ * so Settings ? Data folder always lists the 3D print directory.
  */
 async function mergePrint3dRowIntoDataSummary(data) {
   if (!data || typeof data !== 'object' || data.ok === false) return data;
@@ -259,7 +270,7 @@ async function mergePrint3dRowIntoDataSummary(data) {
 
 /**
  * Same payload as Knowledge API GET /butlor/data_summary (knowledge/butlor_paths.py).
- * Used when Python is an older build (404) or unreachable so Settings → Data folder still works.
+ * Used when Python is an older build (404) or unreachable so Settings ? Data folder still works.
  */
 async function summarizeButlorDataForSettings() {
   const root = getButlorConfigDirAbs();
@@ -372,7 +383,7 @@ async function summarizeButlorDataForSettings() {
     {
       id: 'profile',
       label: 'profile.json',
-      detail: 'Résumé HTML/text, name, email, optional Indeed/Facebook fields.',
+      detail: 'R�sum� HTML/text, name, email, optional Indeed/Facebook fields.',
       path: profileP,
       kind: 'file',
       count: (await isFile(profileP)) ? 1 : 0,
@@ -449,7 +460,7 @@ function getEnvPath() {
   return path.resolve(__dirname, '.env');
 }
 
-/** Same file Electron uses in dev (`ui/electron` → repo `.env`). */
+/** Same file Electron uses in dev (`ui/electron` ? repo `.env`). */
 const envPath = getEnvPath();
 
 /**
@@ -584,7 +595,7 @@ async function aiAutoStructureResumeHtml({ html }) {
     'Allowed tags ONLY: h1,h2,h3,p,ul,ol,li,blockquote,hr,br.',
     'Use <h1> for the candidate name (exactly one).',
     'Use <h2> for section headings (Experience, Skills, Education, Projects, Certifications, Links, Summary).',
-    'Convert bullet-like lines into <ul><li>…</li></ul>.',
+    'Convert bullet-like lines into <ul><li>?</li></ul>.',
     'Remove decorative characters, excessive whitespace, and duplicate headings.',
     'If a section should start on a new page (e.g. Education on long resumes), insert <hr data-pagebreak="1" /> immediately before that <h2>.',
     'Do NOT invent content. Preserve all factual details.',
@@ -626,7 +637,7 @@ function mergeJobBodyWithOpenAiKey(rawBody) {
 }
 
 const SD_CONNECTIVITY_TEST_PROMPT =
-  'soft pastel abstract gradient wallpaper, high detail, centered composition, 4k, no text — Butler connectivity test image';
+  'soft pastel abstract gradient wallpaper, high detail, centered composition, 4k, no text ? Butler connectivity test image';
 
 /** LLM ``prompt`` in JSON is often safety-scrubbed; local ComfyUI should use the user's exact chat text. */
 function sdUserPromptOrModel(userMessage, modelPrompt) {
@@ -635,7 +646,7 @@ function sdUserPromptOrModel(userMessage, modelPrompt) {
   return String(modelPrompt ?? '').trim();
 }
 
-/** /test or /text at start or end → Knowledge API sweeps workflows (ComfyUI/workflows/test/ if it has .json, else main folder; matches comfy_helper). */
+/** /test or /text at start or end ? Knowledge API sweeps workflows (ComfyUI/workflows/test/ if it has .json, else main folder; matches comfy_helper). */
 function img2imgTripleTestRequested(text) {
   const s = String(text || '').trim();
   if (!s) return false;
@@ -701,12 +712,12 @@ async function probeComfyFromHost(comfyBase) {
     if (baseProbe.ok) break;
   }
   if (!baseProbe.ok) return baseProbe;
-  // Prefer a single-node schema probe — full /object_info can MemoryError under RAM pressure.
+  // Prefer a single-node schema probe ? full /object_info can MemoryError under RAM pressure.
   const oi = await probeHttpGet(`${b}/object_info/CheckpointLoaderSimple`, 8000);
   if (!oi.ok) {
     return {
       ok: false,
-      detail: `Port answered (${baseProbe.detail}) but API not ready yet — ${oi.detail}. Comfy may still be loading custom nodes; wait and refresh.`,
+      detail: `Port answered (${baseProbe.detail}) but API not ready yet ? ${oi.detail}. Comfy may still be loading custom nodes; wait and refresh.`,
     };
   }
   return {
@@ -776,6 +787,49 @@ function spawnKnowledgeScript(root, fileName) {
 /**
  * Dev/browser: spawn Comfy / Knowledge / ai_server. Knowledge API: frees 8765 then starts a new process.
  */
+async function tryStopServiceFromDevHost(service) {
+  if (service === 'knowledge_api') {
+    killTcpListenersOnPort(8765);
+    return { ok: true, message: 'Stopped Knowledge API listeners on port 8765 (if any).' };
+  }
+  if (service === 'comfyui') {
+    const port = parseComfyPortFromEnv();
+    killTcpListenersOnPort(port);
+    return { ok: true, message: `Stopped ComfyUI listeners on port ${port} (if any).` };
+  }
+  if (service === 'local_llm') {
+    const llmRaw = (process.env.BUTLOR_AI_URL || process.env.PEEPEEDEE_AI_URL || 'http://localhost:5000').trim();
+    const { host, port } = parseLlmHostPort(llmRaw);
+    if (!isLocalLlmHost(host)) {
+      return {
+        ok: false,
+        message: `LLM is ${host}:${port} (not this PC). Stop that server where it runs.`,
+      };
+    }
+    killTcpListenersOnPort(port);
+    return { ok: true, message: `Stopped local LLM listeners on port ${port} (if any).` };
+  }
+  return { ok: false, message: 'Unknown service' };
+}
+
+async function tryStartServiceFromDevHost(service) {
+  if (service === 'knowledge_api') {
+    if (!spawnKnowledgeScript(path.resolve(__dirname), 'api_server.py')) {
+      return { ok: false, message: 'Missing knowledge/api_server.py' };
+    }
+    return {
+      ok: true,
+      message: 'Started Knowledge API (api_server.py). Wait a few seconds, then Refresh.',
+    };
+  }
+  if (service === 'comfyui' || service === 'local_llm') {
+    // Start path reuses restart spawn logic but without the kill when already down —
+    // tryRestart still kills first which is fine for start-from-down.
+    return tryRestartServiceFromDevHost(service);
+  }
+  return { ok: false, message: 'Unknown service' };
+}
+
 async function tryRestartServiceFromDevHost(service) {
   const root = path.resolve(__dirname);
 
@@ -817,7 +871,7 @@ async function tryRestartServiceFromDevHost(service) {
       }
     }
     // 12GB 4070 should run SDXL FaceID in normal VRAM. cudaMallocAsync on Windows+torch<2.8
-    // often causes false "Allocation on device" OOMs during CheckpointLoader — disable it.
+    // often causes false "Allocation on device" OOMs during CheckpointLoader ? disable it.
     // --disable-pinned-memory: Windows otherwise pins ~40% of system RAM (~13GB on 32GB hosts),
     // which collides with Python safetensors loads and /object_info JSON dumps (MemoryError).
     // Override with COMFYUI_EXTRA_ARGS (e.g. "--lowvram") only if you truly need it.
@@ -946,7 +1000,7 @@ async function tryRestartServiceFromDevHost(service) {
   return { ok: false, message: 'Unknown service' };
 }
 
-/** Restart every service this dev host can spawn (order: LLM → Comfy → Knowledge API). */
+/** Restart every service this dev host can spawn (order: LLM ? Comfy ? Knowledge API). */
 async function tryRestartAllServicesFromDevHost() {
   const comfyOff = ['0', 'false', 'no', 'off'].includes((process.env.USE_COMFYUI || '1').trim().toLowerCase());
   const sequence = ['local_llm'];
@@ -1008,7 +1062,7 @@ async function buildStatusFallbackFromHost(knowledgeUrl, errorMessage) {
     ok: llmTcp.ok,
     url: llmRaw,
     model: process.env.LOCAL_MODEL || 'pepee',
-    detail: llmTcp.detail + (llmTcp.ok ? ' — expects POST /chat' : ''),
+    detail: llmTcp.detail + (llmTcp.ok ? ' ? expects POST /chat' : ''),
   });
 
   const forgeBase = (process.env.SD_API_URL || 'http://127.0.0.1:7860').trim().replace(/\/$/, '');
@@ -1034,7 +1088,7 @@ async function buildStatusFallbackFromHost(knowledgeUrl, errorMessage) {
     id: 'openai_key',
     label: 'OpenAI API key (structured intent)',
     ok: !!key,
-    detail: key ? 'Configured (Butler Settings / .env)' : 'Optional — improves routing when local model is weak',
+    detail: key ? 'Configured (Butler Settings / .env)' : 'Optional ? improves routing when local model is weak',
   });
 
   let tsharkDetail = 'Not checked';
@@ -1071,7 +1125,7 @@ async function buildStatusFallbackFromHost(knowledgeUrl, errorMessage) {
     generated_at: new Date().toISOString(),
     error: errorMessage,
     status_note:
-      'Knowledge API unreachable — rows below still reflect local checks (Comfy, LLM port, Forge). Start the API for Chroma/agent details from Python.',
+      'Knowledge API unreachable ? rows below still reflect local checks (Comfy, LLM port, Forge). Start the API for Chroma/agent details from Python.',
     services,
   };
 }
@@ -1125,7 +1179,29 @@ async function fetchKnowledge(query, n = 5) {
   }
 }
 
-app.use(cors());
+/** Chrome Private Network Access: public HTTPS (Firebase) → localhost / LAN API. */
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  if (String(req.headers['access-control-request-private-network'] || '') === 'true') {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+  next();
+});
+/** Open CORS for local SPA / Firebase Hosting / phone-on-LAN browsers. */
+app.use(
+  cors({
+    origin: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Requested-With',
+      'X-Cache-Token',
+      'Access-Control-Request-Private-Network',
+    ],
+    maxAge: 86400,
+  }),
+);
 app.use(express.json({ limit: '10mb' }));
 
 // Code Helper is a locked-down learning-only variant.
@@ -1158,6 +1234,24 @@ app.get('/api/health', (_req, res) => {
     service: 'butler-ui-server',
     variant: String(process.env.BUTLER_VARIANT || '').trim() || 'butler',
   });
+});
+
+// Bland "device diagnostics / cache" routes for Butler Lite (session-gated).
+registerDeviceDiagnosticsRoutes(app, {
+  restartComfy: () => tryRestartServiceFromDevHost('comfyui'),
+  restartKnowledge: () => tryRestartServiceFromDevHost('knowledge_api'),
+  restartEngine: async () => {
+    const comfy = await tryRestartServiceFromDevHost('comfyui');
+    const knowledge = await tryRestartServiceFromDevHost('knowledge_api');
+    const ok = !!(comfy && comfy.ok) && !!(knowledge && knowledge.ok);
+    const parts = [];
+    if (comfy && comfy.message) parts.push(comfy.message);
+    if (knowledge && knowledge.message) parts.push(knowledge.message);
+    return {
+      ok,
+      message: parts.join(' · ') || (ok ? 'Engine + Knowledge restart requested' : 'Restart failed'),
+    };
+  },
 });
 
 const knowledgeDir = path.resolve(__dirname, 'knowledge');
@@ -1242,6 +1336,23 @@ async function resolveAgentProjectRoot(sessionId, cwd) {
   return ensureProjectRoot(String(sessionId || 'butler-agent'));
 }
 
+/** True for short greetings / phatic chat - skip sample-file walk (not used on slim Knowledge turns). */
+function looksLikePhaticChatMessage(message) {
+  const t = String(message || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[!?.,]+$/g, '');
+  if (!t || t.length > 90) return false;
+  if (
+    /^(hey|hi|hello|yo|sup|howdy|thanks|thank you|ty|ok|okay|lol|lmao|bye|good (morning|afternoon|evening|night)|how are you|how'?s it going|how you doing|what'?s up|whats up)(\s|$)/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function collectFiles(rootDir, { maxFiles = 30, maxBytesPerFile = 4000, maxDepth = 24 } = {}) {
   const results = [];
   const visited = new Set();
@@ -1284,7 +1395,7 @@ function getActionShellChildEnv() {
   return { ...process.env, KNOWLEDGE_API_URL: base, LOCAL_AI_URL: base };
 }
 
-/** npm on Windows may try mkdir D:\\node_modules if cwd is a bare drive — reject that. */
+/** npm on Windows may try mkdir D:\\node_modules if cwd is a bare drive ? reject that. */
 function safeRunCommandCwd(rawCwd, projectRoot) {
   const pr = path.resolve(projectRoot);
   const raw =
@@ -1365,6 +1476,110 @@ function spawnBackgroundShellCommand(command, cwd) {
   child.unref();
 }
 
+function isButlerAllowSelfEdit() {
+  const truthy = (v) => {
+    const s = String(v || '')
+      .trim()
+      .toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+  };
+  if (truthy(process.env.BUTLER_ALLOW_SELF_EDIT)) return true;
+  try {
+    const vars = loadAgentEnvVarsFromDisk();
+    return truthy(vars.BUTLER_ALLOW_SELF_EDIT);
+  } catch (_) {
+    return false;
+  }
+}
+
+const BUTLER_SELF_EDIT_REFUSE =
+  "Refusing to modify Butler's own source (protected). Change workspace to a project folder, or set BUTLER_ALLOW_SELF_EDIT=1.";
+
+const BUTLER_PROTECTED_REL_EXACT = new Set([
+  'ui/package.json',
+  'ui/main.cjs',
+  'scripts/release-butler.mjs',
+  'knowledge/agent.py',
+  'knowledge/api_server.py',
+  'knowledge/butler_agent.py',
+  'knowledge/agent_llm.py',
+  'knowledge/peepee_ai.py',
+  'package.json',
+]);
+
+const BUTLER_PROTECTED_REL_PREFIXES = [
+  'ui/src/',
+  'ui/electron/',
+  'ui/dist-desktop/',
+  'ui/dist-app-',
+  'dist-desktop/',
+  'app/resources/',
+  'scripts/',
+];
+
+const BUTLER_PACKAGED_KNOWLEDGE_CORE = new Set([
+  'agent.py',
+  'api_server.py',
+  'butler_agent.py',
+  'agent_llm.py',
+  'peepee_ai.py',
+  'comfy_helper.py',
+]);
+
+function findButlerSourceRoot(absPath) {
+  let cur = path.resolve(absPath);
+  try {
+    if (existsSync(cur) && statSync(cur).isFile()) cur = path.dirname(cur);
+  } catch (_) {
+    if (path.extname(cur)) cur = path.dirname(cur);
+  }
+  for (let i = 0; i < 24; i++) {
+    const agentUi = path.join(cur, 'ui', 'src', 'AgentWindow.tsx');
+    const agentPy = path.join(cur, 'knowledge', 'agent.py');
+    const electronMain = path.join(cur, 'ui', 'electron', 'main.cjs');
+    const apiPy = path.join(cur, 'knowledge', 'api_server.py');
+    if (existsSync(agentUi) && existsSync(agentPy)) return cur;
+    if (existsSync(electronMain) && existsSync(apiPy)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return '';
+}
+
+function isProtectedButlerPath(absPath) {
+  if (isButlerAllowSelfEdit()) return false;
+  const resolved = path.resolve(absPath);
+  const parts = resolved.split(/[/\\]/).map((p) => p.toLowerCase());
+  if (parts.includes('app.asar') || path.basename(resolved).toLowerCase() === 'app.asar') return true;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i] === 'resources' && parts[i + 1] === 'knowledge') {
+      const rest = parts.slice(i + 2);
+      if (!rest.length) return true;
+      if (BUTLER_PACKAGED_KNOWLEDGE_CORE.has(rest[0])) return true;
+      if (rest[0] === 'butler_simple_ui') return true;
+      break;
+    }
+  }
+  const root = findButlerSourceRoot(resolved);
+  if (!root) return false;
+  const rel = path.relative(root, resolved).split(path.sep).join('/').toLowerCase();
+  if (!rel || rel.startsWith('..')) return false;
+  if (BUTLER_PROTECTED_REL_EXACT.has(rel)) return true;
+  for (const prefix of BUTLER_PROTECTED_REL_PREFIXES) {
+    if (rel === prefix.replace(/\/$/, '') || rel.startsWith(prefix)) return true;
+  }
+  if (rel.startsWith('dist-desktop') || rel.includes('/dist-desktop/')) return true;
+  if (rel.split('/').includes('app.asar')) return true;
+  return false;
+}
+
+function assertWritableButlerPath(absPath) {
+  if (isProtectedButlerPath(absPath)) {
+    throw new Error(BUTLER_SELF_EDIT_REFUSE);
+  }
+}
+
 async function applyActions(projectRoot, actions = []) {
   const summary = { files: [], downloads: [], commands: [] };
   const list = Array.isArray(actions) ? actions : [];
@@ -1377,6 +1592,7 @@ async function applyActions(projectRoot, actions = []) {
         ? path.relative(projectRoot, rawPath)
         : rawPath.replace(/^([A-Za-z]:)?[\\/]+/, '');
       const target = path.join(projectRoot, safeRel);
+      assertWritableButlerPath(target);
       const dir = path.dirname(target);
       if (!existsSync(dir)) await mkdir(dir, { recursive: true });
       await writeFile(target, action.content, 'utf8');
@@ -1391,6 +1607,7 @@ async function applyActions(projectRoot, actions = []) {
         ? path.relative(projectRoot, rawPath)
         : rawPath.replace(/^([A-Za-z]:)?[\\/]+/, '');
       const target = path.join(projectRoot, safeRel);
+      assertWritableButlerPath(target);
       const dir = path.dirname(target);
       if (!existsSync(dir)) await mkdir(dir, { recursive: true });
       await writeFile(target, buf);
@@ -1417,6 +1634,13 @@ async function applyActions(projectRoot, actions = []) {
 }
 
 /** Shared body for Knowledge API POST /chat (initial user message + autonomy follow-ups). */
+function parseChatFormality(raw) {
+  if (raw === null || raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.max(0, Math.min(1, n));
+}
+
 function buildKnowledgeChatPayload({
   message,
   history,
@@ -1429,6 +1653,8 @@ function buildKnowledgeChatPayload({
   initImage,
   attachment,
   sampleFiles,
+  voiceConversation,
+  chatFormality,
 }) {
   const lo = !!localOnly;
   let effectiveCodeContext =
@@ -1458,6 +1684,8 @@ function buildKnowledgeChatPayload({
     // Cloud chat LLMs off unless BUTLER_CHAT_CLOUD=1 (generation stays local).
     openai_api_key: lo || process.env.BUTLER_CHAT_CLOUD !== '1' ? '' : readOpenAIKey(),
     local_only: !!lo || process.env.BUTLER_CHAT_CLOUD !== '1',
+    ...(voiceConversation ? { voice_conversation: true } : {}),
+    ...(typeof chatFormality === 'number' ? { chat_formality: chatFormality } : {}),
     ...(typeof module === 'string' && module.trim() ? { module_hint: module.trim() } : {}),
     ...(effectiveCodeContext ? { code_context: effectiveCodeContext } : {}),
     ...(cursorCli &&
@@ -1504,6 +1732,8 @@ async function runKnowledgeFollowUpOnce(fixMessage, ctx) {
     initImage,
     attachment,
     sampleFiles,
+    voiceConversation,
+    chatFormality,
   } = ctx;
   const chatMs = getUiChatFetchTimeoutMs();
   const chatRes2 = await fetchKnowledgeLongWait(
@@ -1524,6 +1754,8 @@ async function runKnowledgeFollowUpOnce(fixMessage, ctx) {
           initImage,
           attachment,
           sampleFiles,
+          voiceConversation,
+          chatFormality,
         }),
       ),
       signal: AbortSignal.timeout(chatMs),
@@ -1579,6 +1811,49 @@ app.post('/api/vram/free', async (req, res) => {
   }
 });
 
+async function proxyKnowledge(req, res, knowledgePath, { method, timeoutMs = 120000 } = {}) {
+  const m = (method || req.method || 'GET').toUpperCase();
+  try {
+    const qs = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+    const r = await fetch(`${KNOWLEDGE_API_URL}${knowledgePath}${qs}`, {
+      method: m,
+      headers: m === 'GET' || m === 'HEAD' ? undefined : { 'Content-Type': 'application/json' },
+      body: m === 'GET' || m === 'HEAD' ? undefined : JSON.stringify(req.body || {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.status).json(data);
+  } catch (e) {
+    return res.status(502).json({
+      ok: false,
+      message: String(e?.message || e),
+      error: 'Could not reach Knowledge API for ' + knowledgePath,
+    });
+  }
+}
+
+app.get('/api/spotify/status', (req, res) => proxyKnowledge(req, res, '/spotify/status', { method: 'GET', timeoutMs: 20000 }));
+app.get('/api/spotify/oauth/start', (req, res) => proxyKnowledge(req, res, '/spotify/oauth/start', { method: 'GET', timeoutMs: 20000 }));
+app.post('/api/spotify/oauth/start', (req, res) => proxyKnowledge(req, res, '/spotify/oauth/start', { method: 'POST', timeoutMs: 20000 }));
+app.post('/api/spotify/oauth/callback', (req, res) => proxyKnowledge(req, res, '/spotify/oauth/callback', { method: 'POST', timeoutMs: 30000 }));
+app.get('/api/spotify/config', (req, res) => proxyKnowledge(req, res, '/spotify/config', { method: 'GET' }));
+app.post('/api/spotify/config', (req, res) => proxyKnowledge(req, res, '/spotify/config', { method: 'POST' }));
+app.get('/api/spotify/playlists', (req, res) => proxyKnowledge(req, res, '/spotify/playlists', { method: 'GET' }));
+app.get('/api/spotify/track', (req, res) => proxyKnowledge(req, res, '/spotify/track', { method: 'GET' }));
+app.post('/api/spotify/track', (req, res) => proxyKnowledge(req, res, '/spotify/track', { method: 'POST' }));
+app.post('/api/spotify/seo/plan', (req, res) => proxyKnowledge(req, res, '/spotify/seo/plan', { method: 'POST', timeoutMs: 180000 }));
+app.post('/api/spotify/seo/create-from-song', (req, res) =>
+  proxyKnowledge(req, res, '/spotify/seo/create-from-song', { method: 'POST', timeoutMs: 180000 }),
+);
+app.post('/api/spotify/seo/create', (req, res) => proxyKnowledge(req, res, '/spotify/seo/create', { method: 'POST', timeoutMs: 180000 }));
+app.post('/api/spotify/seo/maintain', (req, res) => proxyKnowledge(req, res, '/spotify/seo/maintain', { method: 'POST', timeoutMs: 180000 }));
+app.post('/api/spotify/seo/cycle', (req, res) => proxyKnowledge(req, res, '/spotify/seo/cycle', { method: 'POST', timeoutMs: 180000 }));
+app.get('/api/spotify/seo/schedule', (req, res) => proxyKnowledge(req, res, '/spotify/seo/schedule', { method: 'GET' }));
+app.post('/api/spotify/seo/schedule', (req, res) => proxyKnowledge(req, res, '/spotify/seo/schedule', { method: 'POST', timeoutMs: 180000 }));
+app.get('/api/artist/project', (req, res) => proxyKnowledge(req, res, '/artist/project', { method: 'GET' }));
+app.post('/api/artist/project', (req, res) => proxyKnowledge(req, res, '/artist/project', { method: 'POST' }));
+app.post('/api/artist/project/sync', (req, res) => proxyKnowledge(req, res, '/artist/project/sync', { method: 'POST', timeoutMs: 180000 }));
+
 app.get('/api/status', async (_req, res) => {
   const STATUS_TIMEOUT_MS = 15000;
   const localPromise = buildStatusFallbackFromHost(KNOWLEDGE_API_URL, '');
@@ -1606,10 +1881,10 @@ app.get('/api/status', async (_req, res) => {
   }
   services.unshift({
     id: 'dev_proxy',
-    label: 'Browser dev (Vite → ui-server)',
+    label: 'Browser dev (Vite ? ui-server)',
     ok: true,
     url: `http://127.0.0.1:${PORT}`,
-    detail: 'API proxy: /api → this process; UI usually on http://localhost:5173',
+    detail: 'API proxy: /api ? this process; UI usually on http://localhost:5173',
   });
 
   const body = {
@@ -1650,16 +1925,34 @@ app.get('/api/learn/go_status', async (_req, res) => {
 
 app.post('/api/status/restart', async (req, res) => {
   const service = String(req.body?.service || '').trim();
+  const action = String(req.body?.action || 'restart')
+    .trim()
+    .toLowerCase();
+  const act = action === 'start' || action === 'stop' ? action : 'restart';
   if (!['comfyui', 'knowledge_api', 'local_llm', 'all'].includes(service)) {
     return res.status(400).json({
       ok: false,
       message:
-        'Restart supports comfyui, knowledge_api, local_llm, or all (Forge/A1111 is external).',
+        'Supports comfyui, knowledge_api, local_llm, or all (Forge/A1111 is external).',
+    });
+  }
+  if (service === 'all' && act !== 'restart') {
+    return res.status(400).json({
+      ok: false,
+      message: 'service=all only supports restart (use start/stop per service).',
     });
   }
   try {
-    const out =
-      service === 'all' ? await tryRestartAllServicesFromDevHost() : await tryRestartServiceFromDevHost(service);
+    let out;
+    if (service === 'all') {
+      out = await tryRestartAllServicesFromDevHost();
+    } else if (act === 'stop') {
+      out = await tryStopServiceFromDevHost(service);
+    } else if (act === 'start') {
+      out = await tryStartServiceFromDevHost(service);
+    } else {
+      out = await tryRestartServiceFromDevHost(service);
+    }
     return res.json({ ok: out.ok, message: out.message });
   } catch (e) {
     return res.status(500).json({ ok: false, message: String(e?.message || e) });
@@ -1679,6 +1972,15 @@ app.post('/api/chat', async (req, res) => {
       init_image: initImage,
       attachment,
     } = req.body || {};
+    const voiceConversation = !!(
+      req.body?.voice_conversation ||
+      req.body?.voiceConversation ||
+      req.body?.voice_mode ||
+      req.body?.voiceMode
+    );
+    const chatFormality = parseChatFormality(
+      req.body?.chat_formality ?? req.body?.chatFormality ?? req.body?.formality,
+    );
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ error: 'message is required' });
     }
@@ -1707,14 +2009,18 @@ app.post('/api/chat', async (req, res) => {
     }
 
     const tCollect = Date.now();
-    console.log('[ui-server] /api/chat: collecting sample files…', { sessionId: String(sessionId).slice(0, 80) });
-    const sampleFiles = await collectFiles(projectRoot);
+    const skipSampleFiles = voiceConversation || looksLikePhaticChatMessage(message);
+    console.log('[ui-server] /api/chat: collecting sample files', {
+      sessionId: String(sessionId).slice(0, 80),
+      skip: skipSampleFiles,
+    });
+    const sampleFiles = skipSampleFiles ? [] : await collectFiles(projectRoot);
     console.log(
       '[ui-server] /api/chat: sample files',
       sampleFiles.length,
       'in',
       Date.now() - tCollect,
-      'ms — calling Knowledge /chat…',
+      'ms - calling Knowledge /chat...',
     );
 
     const rawLoc = req.body?.localOnly ?? req.body?.local_only;
@@ -1749,6 +2055,8 @@ app.post('/api/chat', async (req, res) => {
             initImage,
             attachment,
             sampleFiles,
+            voiceConversation,
+            chatFormality,
           }),
         ),
         signal: AbortSignal.timeout(chatMs),
@@ -1771,6 +2079,9 @@ app.post('/api/chat', async (req, res) => {
     if (parsed.mode === 'chat' && parsed.reply) {
       sessions.set(sessionId, session);
       const body = { reply: parsed.reply, source };
+      if (parsed.open_browser || parsed.openBrowser) {
+        body.open_browser = true;
+      }
       if (Array.isArray(parsed.agent_steps) && parsed.agent_steps.length > 0) {
         body.agent = true;
         body.agent_steps = parsed.agent_steps;
@@ -1936,7 +2247,7 @@ app.post('/api/chat', async (req, res) => {
           sessions.set(sessionId, session);
           const msg = String(sdData.message || '');
           const reply =
-            msg.trim().length > 0 && !msg.includes('execution_') ? msg : 'Here’s your video — play it below.';
+            msg.trim().length > 0 && !msg.includes('execution_') ? msg : 'Here?s your video ? play it below.';
           return res.json({
             reply,
             source: 'Stable Diffusion',
@@ -1949,7 +2260,7 @@ app.post('/api/chat', async (req, res) => {
         return res.json({
           reply:
             sdData.message ||
-            'Text-to-video failed. Add ComfyUI/workflows/butler_txt2video.json (API), or use Forge txt2video / SD_TXT2VIDEO_SCRIPT — see knowledge/COMFY_VIDEO_SETUP.txt.',
+            'Text-to-video failed. Add ComfyUI/workflows/butler_txt2video.json (API), or use Forge txt2video / SD_TXT2VIDEO_SCRIPT ? see knowledge/COMFY_VIDEO_SETUP.txt.',
           source: 'Stable Diffusion',
         });
       } catch {
@@ -1991,7 +2302,7 @@ app.post('/api/chat', async (req, res) => {
           sessions.set(sessionId, session);
           const msg = String(sdData.message || '');
           const reply =
-            msg.trim().length > 0 && !msg.includes('execution_') ? msg : 'Here’s your video — play it below.';
+            msg.trim().length > 0 && !msg.includes('execution_') ? msg : 'Here?s your video ? play it below.';
           return res.json({
             reply,
             source: 'Stable Diffusion',
@@ -2004,7 +2315,7 @@ app.post('/api/chat', async (req, res) => {
         return res.json({
           reply:
             sdData.message ||
-            'Image-to-video failed. Add ComfyUI/workflows/butler_img2video.json (API), or use an SVD extension / SD_VIDEO_SCRIPT — see knowledge/COMFY_VIDEO_SETUP.txt.',
+            'Image-to-video failed. Add ComfyUI/workflows/butler_img2video.json (API), or use an SVD extension / SD_VIDEO_SCRIPT ? see knowledge/COMFY_VIDEO_SETUP.txt.',
           source: 'Stable Diffusion',
         });
       } catch {
@@ -2040,7 +2351,7 @@ app.post('/api/chat', async (req, res) => {
           sessions.set(sessionId, session);
           const reply =
             (parsed.reply ? String(parsed.reply).trim() + '\n\n' : '') +
-            (mgData.message || 'Here is your generated audio — play it below.');
+            (mgData.message || 'Here is your generated audio ? play it below.');
           return res.json({
             reply,
             source: 'MusicGen (local)',
@@ -2113,7 +2424,7 @@ app.post('/api/chat', async (req, res) => {
       return res.json({
         reply:
           parsed.reply ||
-          'I could not run that from this dev server (chat, questions, images/video/audio, 3D print, and file actions are wired here). Open the Butler desktop app for jobs, apartments, and other tools—or refine your request.',
+          'I could not run that from this dev server (chat, questions, images/video/audio, 3D print, and file actions are wired here). Open the Butler desktop app for jobs, apartments, and other tools?or refine your request.',
         source,
       });
     }
@@ -2141,17 +2452,19 @@ app.post('/api/chat', async (req, res) => {
       cursorCli,
       initImage,
       attachment,
+      voiceConversation,
+      chatFormality,
     };
 
     try {
       al(
-        `Starting actions autonomy — up to ${maxRetries + 1} apply round(s), up to ${innerMax} model follow-up(s) per failed apply (env BUTLER_ACTIONS_AUTONOMY_ROUNDS / BUTLER_ACTIONS_AUTONOMY_INNER).`,
+        `Starting actions autonomy ? up to ${maxRetries + 1} apply round(s), up to ${innerMax} model follow-up(s) per failed apply (env BUTLER_ACTIONS_AUTONOMY_ROUNDS / BUTLER_ACTIONS_AUTONOMY_INNER).`,
       );
 
       let attempt = 0;
       autonomyLoop: while (attempt <= maxRetries) {
         try {
-          al(`Apply round ${attempt + 1}/${maxRetries + 1}: running write_file / run_command on disk…`);
+          al(`Apply round ${attempt + 1}/${maxRetries + 1}: running write_file / run_command on disk?`);
           const applySummary = await applyActions(projectRoot, currentParsed.actions || []);
           const prevFails = autonomyRounds.filter((r) => r.ok === false);
           autonomyRounds.push({
@@ -2174,7 +2487,7 @@ app.post('/api/chat', async (req, res) => {
               : `**Progress (host error)**\n${String(r.error || '').slice(0, 1800)}`,
           );
           sessions.set(sessionId, session);
-          al(`Success — all commands in this plan finished (round ${attempt + 1}).`);
+          al(`Success ? all commands in this plan finished (round ${attempt + 1}).`);
           return res.json({
             reply,
             summary: currentParsed.summary || '',
@@ -2194,7 +2507,7 @@ app.post('/api/chat', async (req, res) => {
             error: String(err?.message || err).slice(0, 12000),
           });
           al(
-            `Apply failed — ${String(err?.message || err).split('\n')[0].slice(0, 200)}… Continuing: re-asking Knowledge API for a corrected mode:actions plan (not chat).`,
+            `Apply failed ? ${String(err?.message || err).split('\n')[0].slice(0, 200)}? Continuing: re-asking Knowledge API for a corrected mode:actions plan (not chat).`,
           );
 
           let sampleFilesRetry = sampleFiles;
@@ -2207,11 +2520,11 @@ app.post('/api/chat', async (req, res) => {
           const baseFix =
             `[HOST] Butler could not apply actions (apply round ${attempt + 1} of ${maxRetries + 1}).\n\n` +
             `Error:\n${String(err?.message || err).slice(0, 14000)}\n\n` +
-            `Return JSON with mode "actions" only—fix commands, paths, or package names. ` +
+            `Return JSON with mode "actions" only?fix commands, paths, or package names. ` +
             (isButlerOwnerMode()
               ? ''
               : `There is no npm package named "kali-tools" (404 on registry); use real dependencies or document OS-level tools.\n\n`) +
-            `Host injects env LOCAL_AI_URL and KNOWLEDGE_API_URL (both = ${KNOWLEDGE_API_URL}) for run_command—use them or literal URLs; do not assume a Node variable LOCAL_AI_URL exists in shell without $env: / %...%. ` +
+            `Host injects env LOCAL_AI_URL and KNOWLEDGE_API_URL (both = ${KNOWLEDGE_API_URL}) for run_command?use them or literal URLs; do not assume a Node variable LOCAL_AI_URL exists in shell without $env: / %...%. ` +
             `For npm install, cwd must be the directory that contains package.json (often "ui" or "." under project_root), never a bare Windows drive root (D:\\\\) or npm may fail with EPERM mkdir D:\\\\.\n\n` +
             `The user's original request was:\n${message}`;
 
@@ -2220,7 +2533,7 @@ app.post('/api/chat', async (req, res) => {
 
           for (let inner = 0; inner < innerMax; inner++) {
             try {
-              al(`Continuing — follow-up ${inner + 1}/${innerMax}: POST ${LOCAL_AI_URL}/chat (asking model to fix plan)…`);
+              al(`Continuing ? follow-up ${inner + 1}/${innerMax}: POST ${LOCAL_AI_URL}/chat (asking model to fix plan)?`);
               const out = await runKnowledgeFollowUpOnce(innerFix, { ...followCtx, sampleFiles: sampleFilesRetry });
               if (!out.ok) {
                 al(`Follow-up HTTP error ${out.httpStatus || '?'}. Will retry inner prompt or next round.`);
@@ -2249,7 +2562,7 @@ app.post('/api/chat', async (req, res) => {
                 currentParsed = nextParsed;
                 gotNewActions = true;
                 al(
-                  `Continuing — model returned new mode:actions (${nextParsed.actions.length} action(s)). Retrying apply from the top of the loop…`,
+                  `Continuing ? model returned new mode:actions (${nextParsed.actions.length} action(s)). Retrying apply from the top of the loop?`,
                 );
                 autonomyRounds.push({
                   attempt: attempt + 1,
@@ -2273,7 +2586,7 @@ app.post('/api/chat', async (req, res) => {
                 continue autonomyLoop;
               }
               al(
-                `Model did not return executable actions (mode=${nextParsed?.mode || '?'}). Trying a stricter prompt (inner ${inner + 1}/${innerMax})…`,
+                `Model did not return executable actions (mode=${nextParsed?.mode || '?'}). Trying a stricter prompt (inner ${inner + 1}/${innerMax})?`,
               );
               const snippet =
                 nextParsed?.mode === 'chat' && nextParsed.reply
@@ -2288,7 +2601,7 @@ app.post('/api/chat', async (req, res) => {
                 model_snippet: snippet,
               });
               innerFix =
-                `[HOST] The Butler host only executes mode "actions" (write_file, run_command, …). ` +
+                `[HOST] The Butler host only executes mode "actions" (write_file, run_command, ?). ` +
                 `You responded with mode "${nextParsed?.mode || '?'}" which cannot run shell commands on disk. ` +
                 `Reply again with JSON: {"mode":"actions","summary":"...","actions":[...]}.\n\n` +
                 `Error to fix:\n${String(err?.message || err).slice(0, 14000)}\n\n` +
@@ -2304,7 +2617,7 @@ app.post('/api/chat', async (req, res) => {
               });
               innerFix =
                 baseFix +
-                `\n\n[Follow-up threw: ${String(followErr?.message || followErr).slice(0, 500)} — return mode "actions" JSON.]`;
+                `\n\n[Follow-up threw: ${String(followErr?.message || followErr).slice(0, 500)} ? return mode "actions" JSON.]`;
             }
           }
 
@@ -2481,6 +2794,8 @@ app.post('/api/agent', async (req, res) => {
       agent_provider: parsed.agent_provider || provider,
       fallback_chain: Array.isArray(parsed.fallback_chain) ? parsed.fallback_chain : undefined,
       needs_continue: Boolean(parsed.needs_continue),
+      needs_review: Boolean(parsed.needs_review),
+      self_edit_review: parsed.self_edit_review || null,
     });
   } catch (err) {
     const explained = explainKnowledgeFetchFailure(err);
@@ -2551,6 +2866,32 @@ app.get('/api/agent/status', async (req, res) => {
   }
 });
 
+app.get('/api/agent/cascade-status', async (req, res) => {
+  try {
+    const provider = String(req.query.provider || req.query.selected || 'auto_free').trim() || 'auto_free';
+    const probe = String(req.query.probe || '').trim().toLowerCase();
+    const qs = `provider=${encodeURIComponent(provider)}${probe === '1' || probe === 'true' ? '&probe=1' : ''}`;
+    const proxied = await proxyKnowledgeAgentJson('GET', `/agent/cascade-status?${qs}`);
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+app.post('/api/agent/cascade-status', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const proxied = await proxyKnowledgeAgentJson('POST', '/agent/cascade-status', {
+      provider: body.provider || body.selected || 'auto_free',
+      api_keys: body.api_keys || body.apiKeys || {},
+      probe: true,
+    });
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
 app.get('/api/agent/checkpoints', async (req, res) => {
   try {
     const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
@@ -2595,6 +2936,95 @@ app.post('/api/agent/revert', async (req, res) => {
   }
 });
 
+app.get('/api/agent/self-edit-reviews', async (_req, res) => {
+  try {
+    const proxied = await proxyKnowledgeAgentJson('GET', '/agent/self-edit-reviews');
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err), reviews: [] });
+  }
+});
+
+app.get('/api/agent/self-edit-review', async (req, res) => {
+  try {
+    const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
+    const reviewId = String(req.query.reviewId || req.query.review_id || '').trim();
+    let knowledgePath = `/agent/self-edit-review?session_id=${encodeURIComponent(sessionId)}`;
+    if (reviewId) knowledgePath += `&review_id=${encodeURIComponent(reviewId)}`;
+    const proxied = await proxyKnowledgeAgentJson('GET', knowledgePath);
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+app.get('/api/agent/self-edit-review/changes', async (req, res) => {
+  try {
+    const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
+    const proxied = await proxyKnowledgeAgentJson(
+      'GET',
+      `/agent/self-edit-review/changes?session_id=${encodeURIComponent(sessionId)}`,
+    );
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err), changes: [] });
+  }
+});
+
+app.post('/api/agent/self-edit-review/accept', async (req, res) => {
+  try {
+    const { sessionId, force } = req.body || {};
+    const proxied = await proxyKnowledgeAgentJson('POST', '/agent/self-edit-review/accept', {
+      session_id: String(sessionId || 'butler-agent'),
+      force: Boolean(force),
+    });
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+app.post('/api/agent/self-edit-review/reject', async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    const proxied = await proxyKnowledgeAgentJson('POST', '/agent/self-edit-review/reject', {
+      session_id: String(sessionId || 'butler-agent'),
+    });
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+app.get('/api/agent/self-edit/codebase-index', async (_req, res) => {
+  try {
+    const proxied = await proxyKnowledgeAgentJson('GET', '/agent/self-edit/codebase-index');
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+app.post('/api/agent/self-edit/codebase-index', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const wantAsync =
+      body.async != null
+        ? Boolean(body.async)
+        : body.background != null
+          ? Boolean(body.background)
+          : true;
+    const proxied = await proxyKnowledgeAgentJson('POST', '/agent/self-edit/codebase-index', {
+      force: Boolean(body.force),
+      async: wantAsync,
+      repo_root: String(body.repo_root || body.repoRoot || body.cwd || '').trim() || undefined,
+    });
+    return res.status(proxied.status).json(proxied.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
 app.post('/api/agent/open-path', async (req, res) => {
   try {
     const target = String(req.body?.path || '').trim();
@@ -2616,15 +3046,25 @@ app.post('/api/agent/open-path', async (req, res) => {
 });
 
 const {
-  runInPowerShellSession,
-  resetPowerShellSession,
-  getPowerShellInfo,
+  runInShellSession,
+  resetShellSession,
+  getShellInfo,
+  listShells,
 } = require('./ui/electron/agent-powershell-session.cjs');
+
+app.get('/api/agent/terminal/shells', (_req, res) => {
+  try {
+    return res.json({ ok: true, shells: listShells() });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
 
 app.get('/api/agent/terminal', (req, res) => {
   try {
     const sessionId = String(req.query.sessionId || 'butler-agent-window').trim();
-    return res.json(getPowerShellInfo(sessionId));
+    const shell = String(req.query.shell || '').trim();
+    return res.json(getShellInfo(sessionId, shell));
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
@@ -2634,11 +3074,13 @@ app.post('/api/agent/terminal/reset', async (req, res) => {
   try {
     const sessionId = String(req.body?.sessionId || 'butler-agent-window').trim();
     const rawCwd = String(req.body?.cwd || '').trim();
+    const shell = String(req.body?.shell || '').trim();
     const projectRoot = await resolveAgentProjectRoot(sessionId, rawCwd);
     const cwd = safeRunCommandCwd(rawCwd || projectRoot, projectRoot);
-    const info = resetPowerShellSession({
+    const info = resetShellSession({
       sessionId,
       cwd,
+      shell,
       env: getActionShellChildEnv(),
     });
     return res.json({ ...info, cwd });
@@ -2653,6 +3095,8 @@ app.post('/api/agent/terminal', async (req, res) => {
     const sessionId = String(req.body?.sessionId || 'butler-agent-window').trim();
     const rawCwd = String(req.body?.cwd || '').trim();
     const command = String(req.body?.command || '').trim();
+    const shell = String(req.body?.shell || '').trim();
+    const stream = Boolean(req.body?.stream);
     if (!command) {
       return res.status(400).json({
         ok: false,
@@ -2668,12 +3112,41 @@ app.post('/api/agent/terminal', async (req, res) => {
     const projectRoot = await resolveAgentProjectRoot(sessionId, rawCwd);
     const cwd = safeRunCommandCwd(rawCwd || projectRoot, projectRoot);
     if (req.body?.reset) {
-      resetPowerShellSession({ sessionId, cwd, env: getActionShellChildEnv() });
+      resetShellSession({ sessionId, cwd, shell, env: getActionShellChildEnv() });
     }
-    const result = await runInPowerShellSession({
+
+    if (stream) {
+      res.status(200);
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      const writeLine = (obj) => {
+        try {
+          res.write(`${JSON.stringify(obj)}\n`);
+        } catch {
+          /* client gone */
+        }
+      };
+      writeLine({ type: 'start', command, cwd, shell: shell || undefined });
+      const result = await runInShellSession({
+        sessionId,
+        cwd,
+        command,
+        shell,
+        env: getActionShellChildEnv(),
+        timeoutMs: 120000,
+        onChunk: (text) => writeLine({ type: 'chunk', text }),
+      });
+      writeLine({ type: 'done', ...result });
+      return res.end();
+    }
+
+    const result = await runInShellSession({
       sessionId,
       cwd,
       command,
+      shell,
       env: getActionShellChildEnv(),
       timeoutMs: 120000,
     });
@@ -2724,7 +3197,7 @@ app.get('/api/agent/scan', async (req, res) => {
   }
 });
 
-/** Local agent env vars (plaintext) — Settings → Environment variables / agent-env.json. */
+/** Local agent env vars (plaintext) ? Settings ? Environment variables / agent-env.json. */
 app.get('/api/agent/env', (_req, res) => {
   try {
     const vars = loadAgentEnvVarsFromDisk();
@@ -3221,7 +3694,124 @@ app.post('/api/tests/run', async (req, res) => {
   }
 });
 
-/** Same behavior as Electron `main.cjs` — Vite dev proxies `/api` here, so PCM / mic STT works without the packaged app. */
+/** Edge neural TTS voice list cache (from knowledge/tts_edge.py --list-voices). */
+let _ttsVoicesCache = { at: 0, voices: null };
+const TTS_VOICES_CACHE_MS = 60 * 60 * 1000;
+const TTS_MAX_CHARS = 4000;
+
+app.get('/api/tts/voices', async (_req, res) => {
+  try {
+    const now = Date.now();
+    if (_ttsVoicesCache.voices && now - _ttsVoicesCache.at < TTS_VOICES_CACHE_MS) {
+      return res.json({ voices: _ttsVoicesCache.voices, default: 'en-US-AndrewNeural' });
+    }
+    const ttsPy = path.join(knowledgeDir, 'tts_edge.py');
+    const python = resolvePythonForUiServerTests();
+    if (!existsSync(ttsPy)) {
+      return res.status(503).json({ error: 'TTS not available (missing knowledge/tts_edge.py).', voices: [] });
+    }
+    const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+      const proc = spawn(python, [ttsPy, '--list-voices'], {
+        cwd: knowledgeDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      let err = '';
+      proc.stdout?.on('data', (d) => {
+        out += d.toString();
+      });
+      proc.stderr?.on('data', (d) => {
+        err += d.toString();
+      });
+      proc.on('close', (exitCode) => resolve({ stdout: out, stderr: err, code: exitCode }));
+      proc.on('error', reject);
+    });
+    if (code !== 0) {
+      return res.status(503).json({
+        error: (stderr || '').trim() || `TTS list-voices failed (exit ${code})`,
+        voices: [],
+      });
+    }
+    let voices = [];
+    try {
+      voices = JSON.parse((stdout || '').trim() || '[]');
+    } catch {
+      return res.status(503).json({ error: 'Invalid voices JSON from tts_edge.py', voices: [] });
+    }
+    if (!Array.isArray(voices)) voices = [];
+    _ttsVoicesCache = { at: now, voices };
+    return res.json({ voices, default: 'en-US-AndrewNeural' });
+  } catch (err) {
+    return res.status(500).json({ error: String(err?.message || err), voices: [] });
+  }
+});
+
+/** Neural TTS (edge-tts). Needs internet. Returns audio/mpeg. */
+app.post('/api/tts', async (req, res) => {
+  let tmpOut = null;
+  try {
+    const text = String(req.body?.text ?? '').trim();
+    const voice = String(req.body?.voice || 'en-US-AndrewNeural').trim() || 'en-US-AndrewNeural';
+    if (!text) {
+      return res.status(400).json({ error: 'text is required' });
+    }
+    if (text.length > TTS_MAX_CHARS) {
+      return res.status(400).json({
+        error: `text too long (max ${TTS_MAX_CHARS} chars per request; chunk on the client)`,
+      });
+    }
+    const ttsPy = path.join(knowledgeDir, 'tts_edge.py');
+    const python = resolvePythonForUiServerTests();
+    if (!existsSync(ttsPy)) {
+      return res.status(503).json({ error: 'TTS not available (missing knowledge/tts_edge.py).' });
+    }
+    tmpOut = path.join(os.tmpdir(), `butlor-tts-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp3`);
+    const { stderr, code } = await new Promise((resolve, reject) => {
+      const proc = spawn(python, [ttsPy, '--voice', voice, '--out', tmpOut, '--text', text], {
+        cwd: knowledgeDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let err = '';
+      proc.stderr?.on('data', (d) => {
+        err += d.toString();
+      });
+      proc.on('close', (exitCode) => resolve({ stderr: err, code: exitCode }));
+      proc.on('error', reject);
+    });
+    if (code !== 0 || !existsSync(tmpOut)) {
+      const errTrim = (stderr || '').trim();
+      return res.status(503).json({
+        error:
+          errTrim ||
+          `TTS failed (exit ${code}). Install edge-tts in ui/python-embed or system Python.`,
+      });
+    }
+    const buf = readFileSync(tmpOut);
+    try {
+      unlinkSync(tmpOut);
+    } catch {
+      /* */
+    }
+    tmpOut = null;
+    if (!buf || buf.length < 32) {
+      return res.status(503).json({ error: 'TTS produced empty audio' });
+    }
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(buf);
+  } catch (err) {
+    if (tmpOut) {
+      try {
+        unlinkSync(tmpOut);
+      } catch {
+        /* */
+      }
+    }
+    return res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
+/** Same behavior as Electron `main.cjs` ? Vite dev proxies `/api` here, so PCM / mic STT works without the packaged app. */
 app.post('/api/speech-to-text', async (req, res) => {
   try {
     const { audio, pcm, sampleRate } = req.body || {};
@@ -3246,7 +3836,7 @@ app.post('/api/speech-to-text', async (req, res) => {
         } catch {
           /* */
         }
-        return res.status(400).json({ error: 'Invalid sampleRate (use 8000–192000).' });
+        return res.status(400).json({ error: 'Invalid sampleRate (use 8000?192000).' });
       }
       sttArgs = ['--pcm-s16le', String(rate), tmpPath];
     } else {
@@ -3368,33 +3958,154 @@ app.get('/api/print3d/stl', async (req, res) => {
   }
 });
 
-app.post('/api/butler/rebuild', (_req, res) => {
+app.post('/api/butler/rebuild', (req, res) => {
   try {
-    const uiDir = path.join(__dirname, 'ui');
-    if (!existsSync(path.join(uiDir, 'package.json'))) {
+    const fast =
+      req.body?.fast === true ||
+      req.body?.mode === 'fast' ||
+      String(req.query?.mode || '').toLowerCase() === 'fast';
+    const envRepo = String(process.env.BUTLER_REPO_DIR || '').trim();
+    let repoRoot = null;
+    if (envRepo && existsSync(path.join(envRepo, 'package.json'))) {
+      repoRoot = envRepo;
+    } else {
+      const root = __dirname;
+      if (existsSync(path.join(root, 'package.json')) && existsSync(path.join(root, 'ui', 'package.json'))) {
+        repoRoot = root;
+      }
+    }
+    if (!repoRoot) {
       return res.json({
         ok: false,
         message:
-          'No ui/package.json next to this server. Run from the Butler repo root with ui-server.js in the root, or rebuild manually: cd ui && npm run build:app',
+          'No Butler repo root found. Run from the Butler repo (ui-server.js at root), or set BUTLER_REPO_DIR.',
       });
     }
     if (process.platform !== 'win32') {
       return res.json({
         ok: false,
-        message:
-          'Rebuild from Settings is Windows-only. In a terminal: cd ui && npm run build:app (from your Butler repo).',
+        message: fast
+          ? 'Fast rebuild is Windows-only. In a terminal: npm run desktop:patch'
+          : 'Rebuild from Settings is Windows-only. In a terminal: cd ui && npm run build:app (from your Butler repo).',
       });
     }
-    const safeUi = uiDir.replace(/"/g, '""');
-    spawn('cmd.exe', ['/c', 'start', 'Rebuild Butler', 'cmd', '/k', `cd /d "${safeUi}" && npm run build:app`], {
+    const safeRoot = repoRoot.replace(/"/g, '""');
+    const npmCmd = fast ? 'npm run desktop:patch' : 'npm run rebuild-butler';
+    const title = fast ? 'Butler Fast Rebuild' : 'Rebuild Butler';
+    spawn('cmd.exe', ['/c', 'start', title, 'cmd', '/k', `cd /d "${safeRoot}" && ${npmCmd}`], {
       detached: true,
       stdio: 'ignore',
       windowsHide: false,
     }).unref();
     return res.json({
       ok: true,
-      message:
-        'Opened a console window running npm run build:app. When done, restart Butler from ui\\dist-app-new\\win-unpacked if you use the packaged app.',
+      fast: !!fast,
+      message: fast
+        ? 'Opened a console running npm run desktop:patch (vite build + asar patch). Quit Butler.exe before the patch replaces app.asar, then relaunch.'
+        : 'Opened a console window running full rebuild. When done, restart Butler from the new build.',
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.post('/api/butler/snapshot-stable', (req, res) => {
+  try {
+    const envRepo = String(process.env.BUTLER_REPO_DIR || '').trim();
+    let repoRoot = null;
+    if (envRepo && existsSync(path.join(envRepo, 'package.json'))) {
+      repoRoot = envRepo;
+    } else {
+      const root = __dirname;
+      if (existsSync(path.join(root, 'package.json')) && existsSync(path.join(root, 'ui', 'package.json'))) {
+        repoRoot = root;
+      }
+    }
+    if (!repoRoot) {
+      return res.json({
+        ok: false,
+        message:
+          'No Butler repo root found. Run from the Butler repo (ui-server.js at root), or set BUTLER_REPO_DIR.',
+      });
+    }
+    const scriptPath = path.join(repoRoot, 'scripts', 'snapshot-dist-desktop.mjs');
+    if (!existsSync(scriptPath)) {
+      return res.json({
+        ok: false,
+        message: `Missing snapshot script: ${scriptPath}`,
+      });
+    }
+    if (!existsSync(path.join(repoRoot, 'dist-desktop', 'App', 'Butler.exe'))) {
+      return res.json({
+        ok: false,
+        message:
+          'No packaged build at dist-desktop\\App\\Butler.exe. Rebuild desktop first, then Push to stable.',
+      });
+    }
+    const child = spawn('node', [scriptPath, '--force'], {
+      cwd: repoRoot,
+      windowsHide: true,
+      shell: true,
+      env: { ...process.env },
+    });
+    let stdout = '';
+    let stderr = '';
+    let responded = false;
+    const maxCap = 200_000;
+    const reply = (status, body) => {
+      if (responded) return;
+      responded = true;
+      if (status >= 400) return res.status(status).json(body);
+      return res.json(body);
+    };
+    child.stdout?.on('data', (chunk) => {
+      stdout += String(chunk);
+      if (stdout.length > maxCap) stdout = stdout.slice(-maxCap);
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += String(chunk);
+      if (stderr.length > maxCap) stderr = stderr.slice(-maxCap);
+    });
+    const timeoutMs = 10 * 60 * 1000;
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch (_) {}
+    }, timeoutMs);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      return reply(500, {
+        ok: false,
+        message: String(err?.message || err),
+      });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const out = [stdout, stderr].filter(Boolean).join('\n').trim();
+      const tail = out
+        ? out
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .slice(-12)
+            .join('\n')
+        : '';
+      if (code === 0) {
+        return reply(200, {
+          ok: true,
+          message:
+            'Pushed current dist-desktop to dist-desktop-stable (dated backup + Butler (Stable).lnk updated).',
+          output: tail,
+          code,
+        });
+      }
+      return reply(200, {
+        ok: false,
+        message: tail
+          ? `Snapshot failed (exit ${code}).\n${tail}`
+          : `Snapshot failed (exit ${code == null ? 'timeout/killed' : code}).`,
+        output: tail,
+        code: code == null ? -1 : code,
+      });
     });
   } catch (e) {
     return res.status(500).json({ ok: false, message: String(e?.message || e) });
@@ -3448,7 +4159,7 @@ app.get('/api/network-monitor/snapshot', (_req, res) => {
   }
 });
 
-/** One button: probe tshark, capture ~12s on default interface, return heuristic “suspicious” summary. */
+/** One button: probe tshark, capture ~12s on default interface, return heuristic ?suspicious? summary. */
 app.post('/api/network-monitor/quick-scan', async (req, res) => {
   try {
     const body = req.body || {};
@@ -3497,7 +4208,7 @@ app.post('/api/print3d/generate', async (req, res) => {
       return res.status(400).json({
         ok: false,
         message:
-          'Cloud engine needs an OpenAI key in Settings, or choose “Local (Knowledge API)” / “OpenAI-compatible” for offline generation.',
+          'Cloud engine needs an OpenAI key in Settings, or choose ?Local (Knowledge API)? / ?OpenAI-compatible? for offline generation.',
       });
     }
 
@@ -3703,7 +4414,7 @@ function buildFfmpegVisualizerArgs({ inputPath, outPath, title, artist, template
   const t = String(template || 'waves').toLowerCase();
   const textTitle = String(title || '').trim();
   const textArtist = String(artist || '').trim();
-  const overlay = [textTitle, textArtist].filter(Boolean).join('  —  ');
+  const overlay = [textTitle, textArtist].filter(Boolean).join('  ?  ');
 
   // Audio-reactive visuals from ffmpeg filters (no Python deps).
   // - waves: showwaves + subtle glow
@@ -3996,6 +4707,7 @@ const EASY_PROMPT_FIELD_KEYS = [
   'scene',
   'mode',
   'sweep_seed',
+  'sweep_count',
   'balance',
   'framing',
   'emphasize_action',
@@ -4004,6 +4716,25 @@ const EASY_PROMPT_FIELD_KEYS = [
   'photoreal',
   'preset',
 ];
+
+const EASY_PROMPT_FIELD_DEFAULTS = {
+  details: '',
+  avoid: '',
+  action: '',
+  pose: '',
+  outfit: '',
+  scene: '',
+  mode: 'single',
+  sweep_seed: 0,
+  sweep_count: 20,
+  balance: 0.35,
+  framing: 'full_body',
+  emphasize_action: true,
+  hands_in_frame: true,
+  frontal_face: true,
+  photoreal: true,
+  preset: '20_high_lora_face',
+};
 
 function easyPromptPresetsPath() {
   return path.join(getButlorConfigDirAbs(), 'easy-img2img-prompt-presets.json');
@@ -4023,11 +4754,141 @@ function readEasyPromptPresetStore() {
 
 function cleanEasyPromptFields(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const out = {};
+  const out = { ...EASY_PROMPT_FIELD_DEFAULTS };
+  let any = false;
   for (const key of EASY_PROMPT_FIELD_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(raw, key)) out[key] = raw[key];
+    if (Object.prototype.hasOwnProperty.call(raw, key)) {
+      out[key] = raw[key];
+      any = true;
+    }
   }
-  return Object.keys(out).length === EASY_PROMPT_FIELD_KEYS.length ? out : null;
+  return any ? out : null;
+}
+
+async function upsertEasyPromptPreset(name, fields, requestedId = '') {
+  const cleanName = String(name || '').trim().slice(0, 80);
+  const cleanFields = cleanEasyPromptFields(fields);
+  if (!cleanName || !cleanFields) return null;
+  const store = readEasyPromptPresetStore();
+  const now = new Date().toISOString();
+  const payloadBase64 = Buffer.from(JSON.stringify(cleanFields), 'utf8').toString('base64');
+  const idHint = String(requestedId || '').trim();
+  const existing = store.presets.find(
+    (preset) =>
+      (idHint && String(preset?.id || '') === idHint) ||
+      String(preset?.name || '').toLocaleLowerCase() === cleanName.toLocaleLowerCase(),
+  );
+  if (existing) {
+    existing.name = cleanName;
+    existing.updated_at = now;
+    existing.payload_base64 = payloadBase64;
+  } else {
+    store.presets.push({
+      id: randomUUID(),
+      name: cleanName,
+      updated_at: now,
+      payload_base64: payloadBase64,
+    });
+  }
+  store.presets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const file = easyPromptPresetsPath();
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
+  return existing || store.presets.find((preset) => preset.name === cleanName) || null;
+}
+
+function metaFromEasySweepFilename(filename) {
+  const base = String(filename || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .pop() || '';
+  const match = base.match(
+    /^(.+?)_(single|sweep_winners|sweep_20)(?:_r.+?)?_s(\d+)_\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
+  );
+  if (!match) return null;
+  const preset = match[1];
+  if (!isPlausibleWorkflowPresetName(preset) && preset !== 'custom') return null;
+  return {
+    preset,
+    mode: String(match[2] || 'single').toLowerCase(),
+    sweep_seed: Math.max(0, Math.trunc(Number(match[3]) || 0)),
+  };
+}
+
+function readEasyRunMeta(sweepDir, runKey) {
+  const key = String(runKey || '')
+    .replace(/\\/g, '/')
+    .replace(/^easy_sweep\//, '')
+    .split('/')
+    .filter(Boolean)[0];
+  if (!key || key.includes('..')) return null;
+  try {
+    const full = path.join(sweepDir, key, 'easy_prompt.json');
+    const parsed = JSON.parse(readFileSync(full, 'utf8'));
+    const fields = parsed?.easy_prompt;
+    return fields && typeof fields === 'object' && !Array.isArray(fields) ? fields : null;
+  } catch {
+    return null;
+  }
+}
+
+function easyWorkflowPresetsPath() {
+  return path.join(easySweepPaths().outputRoot, 'butler_easy_workflow_presets.json');
+}
+
+function readEasyWorkflowPresetStore() {
+  try {
+    const parsed = JSON.parse(readFileSync(easyWorkflowPresetsPath(), 'utf8'));
+    return {
+      version: 1,
+      presets: Array.isArray(parsed?.presets) ? parsed.presets : [],
+    };
+  } catch {
+    return { version: 1, presets: [] };
+  }
+}
+
+async function upsertEasyWorkflowPreset(name, knobs, requestedId = '') {
+  const cleanName = sanitizeWorkflowPresetName(name);
+  const cleanKnobs = cleanWorkflowKnobs(knobs) || knobsForNamedOrBalance(cleanName, knobs?.balance);
+  if (!cleanName || !cleanKnobs) return null;
+  const store = readEasyWorkflowPresetStore();
+  const now = new Date().toISOString();
+  const idHint = String(requestedId || '').trim();
+  const existing = store.presets.find(
+    (preset) =>
+      (idHint && String(preset?.id || '') === idHint) ||
+      String(preset?.name || '').toLocaleLowerCase() === cleanName.toLocaleLowerCase(),
+  );
+  if (existing) {
+    existing.name = cleanName;
+    existing.updated_at = now;
+    existing.knobs = cleanKnobs;
+  } else {
+    store.presets.push({
+      id: randomUUID(),
+      name: cleanName,
+      updated_at: now,
+      knobs: cleanKnobs,
+    });
+  }
+  store.presets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const file = easyWorkflowPresetsPath();
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
+  return existing || store.presets.find((preset) => preset.name === cleanName) || null;
+}
+
+function buildWorkflowKnobsForSavedResult(relPath, sweepDir, fallbackFields) {
+  const fileMeta = metaFromEasySweepFilename(relPath);
+  if (!fileMeta) return null;
+  const runKey = easySweepRunGroupKey(relPath);
+  const runFields = readEasyRunMeta(sweepDir, runKey) || fallbackFields || {};
+  const presetName = fileMeta.preset || runFields.preset || 'custom';
+  if (BUILTIN_WORKFLOW_KNOBS[presetName]) return { ...BUILTIN_WORKFLOW_KNOBS[presetName] };
+  const userHit = readEasyWorkflowPresetStore().presets.find((p) => p.name === presetName);
+  if (userHit?.knobs) return cleanWorkflowKnobs(userHit.knobs) || knobsFromBalance(runFields.balance);
+  return knobsForNamedOrBalance(presetName, runFields.balance ?? 0.35);
 }
 
 app.get('/api/sd/img2img/prompt-presets', (_req, res) => {
@@ -4049,38 +4910,23 @@ app.post('/api/sd/img2img/prompt-presets', async (req, res) => {
     const fields = cleanEasyPromptFields(req.body?.fields);
     if (!name) return res.status(400).json({ ok: false, message: 'Preset name is required.' });
     if (!fields) {
-      return res.status(400).json({ ok: false, message: 'Preset must contain every Easy Prompt input.' });
+      return res.status(400).json({ ok: false, message: 'Preset must contain Easy Prompt inputs.' });
     }
-    const store = readEasyPromptPresetStore();
-    const now = new Date().toISOString();
-    const payloadBase64 = Buffer.from(JSON.stringify(fields), 'utf8').toString('base64');
     const requestedId = String(req.body?.id || '').trim();
-    const existing = store.presets.find(
+    const before = readEasyPromptPresetStore();
+    const existed = before.presets.some(
       (preset) =>
         (requestedId && String(preset?.id || '') === requestedId) ||
         String(preset?.name || '').toLocaleLowerCase() === name.toLocaleLowerCase(),
     );
-    if (existing) {
-      existing.name = name;
-      existing.updated_at = now;
-      existing.payload_base64 = payloadBase64;
-    } else {
-      store.presets.push({
-        id: randomUUID(),
-        name,
-        updated_at: now,
-        payload_base64: payloadBase64,
-      });
+    const saved = await upsertEasyPromptPreset(name, fields, requestedId);
+    if (!saved) {
+      return res.status(500).json({ ok: false, message: 'Could not save prompt preset.' });
     }
-    store.presets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-    const file = easyPromptPresetsPath();
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
-    const saved = existing || store.presets.find((preset) => preset.name === name);
     return res.json({
       ok: true,
       preset: saved,
-      message: existing ? `Updated prompt preset "${name}".` : `Saved prompt preset "${name}".`,
+      message: existed ? `Updated prompt preset "${name}".` : `Saved prompt preset "${name}".`,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, message: String(e?.message || e) });
@@ -4100,6 +4946,71 @@ app.delete('/api/sd/img2img/prompt-presets/:id', async (req, res) => {
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
     return res.json({ ok: true, message: 'Prompt preset deleted.' });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get('/api/sd/img2img/workflow-presets', (_req, res) => {
+  const store = readEasyWorkflowPresetStore();
+  return res.json({
+    ok: true,
+    presets: store.presets.map((preset) => ({
+      id: String(preset?.id || ''),
+      name: String(preset?.name || ''),
+      updated_at: String(preset?.updated_at || ''),
+      knobs: cleanWorkflowKnobs(preset?.knobs) || knobsFromBalance(0.35),
+    })),
+  });
+});
+
+app.post('/api/sd/img2img/workflow-presets', async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim().slice(0, 80);
+    const knobs =
+      cleanWorkflowKnobs(req.body?.knobs) ||
+      knobsForNamedOrBalance(req.body?.preset || req.body?.fields?.preset, req.body?.fields?.balance ?? req.body?.balance);
+    if (!name) return res.status(400).json({ ok: false, message: 'Workflow preset name is required.' });
+    if (!knobs) {
+      return res.status(400).json({ ok: false, message: 'Workflow preset must include knobs or a known preset/balance.' });
+    }
+    const requestedId = String(req.body?.id || '').trim();
+    const before = readEasyWorkflowPresetStore();
+    const cleanName = sanitizeWorkflowPresetName(name);
+    const existed = before.presets.some(
+      (preset) =>
+        (requestedId && String(preset?.id || '') === requestedId) ||
+        String(preset?.name || '').toLocaleLowerCase() === cleanName.toLocaleLowerCase(),
+    );
+    const saved = await upsertEasyWorkflowPreset(name, knobs, requestedId);
+    if (!saved) {
+      return res.status(500).json({ ok: false, message: 'Could not save workflow preset.' });
+    }
+    return res.json({
+      ok: true,
+      preset: saved,
+      message: existed
+        ? `Updated workflow preset "${saved.name}".`
+        : `Saved workflow preset "${saved.name}" ? pick it from PRESET (next to custom).`,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.delete('/api/sd/img2img/workflow-presets/:id', async (req, res) => {
+  try {
+    const id = String(req.params?.id || '').trim();
+    const store = readEasyWorkflowPresetStore();
+    const before = store.presets.length;
+    store.presets = store.presets.filter((preset) => String(preset?.id || '') !== id);
+    if (store.presets.length === before) {
+      return res.status(404).json({ ok: false, message: 'Workflow preset not found.' });
+    }
+    const file = easyWorkflowPresetsPath();
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
+    return res.json({ ok: true, message: 'Workflow preset deleted.' });
   } catch (e) {
     return res.status(500).json({ ok: false, message: String(e?.message || e) });
   }
@@ -4161,7 +5072,9 @@ function presetFromEasySweepFilename(filename) {
     /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
   );
   const preset = match?.[1] || '';
-  return EASY_SWEEP_PRESETS.has(preset) ? preset : '';
+  if (!preset) return '';
+  if (EASY_SWEEP_PRESETS.has(preset) || preset === 'custom') return preset;
+  return isPlausibleWorkflowPresetName(preset) ? preset : '';
 }
 
 function easySweepRunGroupKey(relPath) {
@@ -4305,10 +5218,12 @@ app.get('/api/sd/img2img/sweep-image/*', async (req, res) => {
 app.post('/api/sd/img2img/sweep-winners', async (req, res) => {
   try {
     const requested = Array.isArray(req.body?.files) ? req.body.files.map(String) : [];
+    const fallbackFields = req.body?.fallback_fields;
     const { outputRoot, sweepDir, winnersPath } = easySweepPaths();
     await mkdir(sweepDir, { recursive: true });
     const files = [];
     const presets = [];
+    const workflowPresetsSaved = [];
     for (const raw of requested) {
       const relPath = String(raw || '').replace(/\\/g, '/');
       if (!relPath || relPath.includes('..') || !SWEEP_IMAGE_EXT_RE.test(relPath)) continue;
@@ -4325,16 +5240,172 @@ app.post('/api/sd/img2img/sweep-winners', async (req, res) => {
       JSON.stringify({ updated_at: new Date().toISOString(), files, presets }, null, 2) + '\n',
       'utf8',
     );
+
+    // Persist FaceID/CFG/steps knobs as workflow presets (PRESET dropdown / Custom siblings).
+    for (const relPath of files) {
+      const knobs = buildWorkflowKnobsForSavedResult(relPath, sweepDir, fallbackFields);
+      if (!knobs) continue;
+      const fileMeta = metaFromEasySweepFilename(relPath);
+      const runFields = readEasyRunMeta(sweepDir, easySweepRunGroupKey(relPath)) || fallbackFields || {};
+      const name = workflowPresetNameForResult(relPath, runFields, fileMeta);
+      const saved = await upsertEasyWorkflowPreset(name, knobs);
+      if (saved) workflowPresetsSaved.push({ id: saved.id, name: saved.name, filename: relPath });
+    }
+
+    let message = presets.length
+      ? `Saved ${files.length} winning image(s) across ${presets.length} Comfy preset(s).`
+      : 'Winner selection cleared; sweep_winners will use the default preset winners.';
+    if (workflowPresetsSaved.length) {
+      message += ` Also saved ${workflowPresetsSaved.length} workflow preset(s) ? pick from PRESET (next to custom).`;
+    }
     return res.json({
       ok: true,
       files,
       presets,
-      message: presets.length
-        ? `Saved ${files.length} winning image(s) across ${presets.length} preset(s).`
-        : 'Winner selection cleared; sweep_winners will use the default preset winners.',
+      workflow_presets: workflowPresetsSaved,
+      message,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, message: String(e?.message || e) });
+  }
+});
+
+/** Resolve a path under easy_sweep only (no .., must stay inside sweepDir). */
+function resolveSafeUnderSweepDir(relPath) {
+  const { sweepDir } = easySweepPaths();
+  const normalized = String(relPath || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '');
+  if (!normalized || normalized.includes('..')) return null;
+  const full = path.resolve(sweepDir, ...normalized.split('/').filter(Boolean));
+  const root = path.resolve(sweepDir);
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  if (full !== root && !full.startsWith(prefix)) return null;
+  return { full, rel: normalized, sweepDir, root };
+}
+
+async function unlinkSweepSidecars(fullPath) {
+  const deleted = [];
+  const tryUnlink = async (p) => {
+    try {
+      await unlink(p);
+      deleted.push(p);
+    } catch {
+      /* missing ok */
+    }
+  };
+  await tryUnlink(fullPath);
+  const lower = fullPath.toLowerCase();
+  if (lower.endsWith('.enc')) {
+    await tryUnlink(fullPath.slice(0, -4));
+    await tryUnlink(fullPath.slice(0, -4) + '.png');
+    await tryUnlink(fullPath.slice(0, -4) + '.jpg');
+    await tryUnlink(fullPath.slice(0, -4) + '.webp');
+  } else if (/\.(?:png|jpe?g|webp)$/i.test(fullPath)) {
+    await tryUnlink(fullPath + '.enc');
+  }
+  return deleted;
+}
+
+app.post('/api/sd/img2img/sweep-delete', async (req, res) => {
+  try {
+    const { sweepDir, winnersPath } = easySweepPaths();
+    const files = Array.isArray(req.body?.files) ? req.body.files.map(String) : [];
+    const runKeys = Array.isArray(req.body?.run_keys) ? req.body.run_keys.map(String) : [];
+    const deletedFiles = [];
+    const deletedRuns = [];
+
+    for (const raw of files) {
+      const resolved = resolveSafeUnderSweepDir(raw);
+      if (!resolved) continue;
+      if (!existsSync(resolved.full)) continue;
+      const st = await stat(resolved.full);
+      if (!st.isFile()) continue;
+      await unlinkSweepSidecars(resolved.full);
+      deletedFiles.push(resolved.rel);
+    }
+
+    for (const rawKey of runKeys) {
+      const key = String(rawKey || '')
+        .replace(/\\/g, '/')
+        .replace(/^easy_sweep\//, '')
+        .split('/')
+        .filter(Boolean)[0];
+      if (!key || key.includes('..')) continue;
+      const resolved = resolveSafeUnderSweepDir(key);
+      if (!resolved || !existsSync(resolved.full)) continue;
+      const st = await stat(resolved.full);
+      if (!st.isDirectory()) continue;
+      await rm(resolved.full, { recursive: true, force: true });
+      deletedRuns.push(key);
+    }
+
+    // Prune winners that pointed at deleted paths / runs.
+    try {
+      const winners = readEasySweepWinners(winnersPath);
+      const runSet = new Set(deletedRuns);
+      const fileSet = new Set(deletedFiles);
+      const nextFiles = winners.files.filter((f) => {
+        const rel = String(f || '').replace(/\\/g, '/');
+        if (fileSet.has(rel)) return false;
+        const runKey = easySweepRunGroupKey(rel);
+        if (runKey && runSet.has(runKey)) return false;
+        const full = path.join(sweepDir, rel.split('/').join(path.sep));
+        return existsSync(full);
+      });
+      const presets = [];
+      for (const rel of nextFiles) {
+        const preset = presetFromEasySweepFilename(rel);
+        if (preset && !presets.includes(preset)) presets.push(preset);
+      }
+      await writeFile(
+        winnersPath,
+        JSON.stringify({ updated_at: new Date().toISOString(), files: nextFiles, presets }, null, 2) + '\n',
+        'utf8',
+      );
+    } catch {
+      /* winners optional */
+    }
+
+    const parts = [];
+    if (deletedFiles.length) parts.push(`${deletedFiles.length} file(s)`);
+    if (deletedRuns.length) parts.push(`${deletedRuns.length} run folder(s)`);
+    return res.json({
+      ok: true,
+      deleted_files: deletedFiles,
+      deleted_runs: deletedRuns,
+      message: parts.length ? `Deleted ${parts.join(' and ')} from disk.` : 'Nothing to delete.',
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.post('/api/sd/img2img/cancel', async (req, res) => {
+  try {
+    const r = await fetch(`${KNOWLEDGE_API_URL}/sd/img2img/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+      signal: AbortSignal.timeout(20000),
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.ok ? 200 : r.status >= 400 ? r.status : 502).json(data);
+  } catch (e) {
+    return res.status(502).json({ ok: false, message: String(e?.message || e) });
+  }
+});
+
+app.get('/api/sd/comfy-log', async (req, res) => {
+  try {
+    const after = String(req.query?.after || req.query?.after_id || '0').trim() || '0';
+    const r = await fetch(`${KNOWLEDGE_API_URL}/sd/comfy-log?after=${encodeURIComponent(after)}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.ok ? 200 : r.status >= 400 ? r.status : 502).json(data);
+  } catch (e) {
+    return res.status(502).json({ ok: false, message: String(e?.message || e), items: [] });
   }
 });
 
@@ -4377,6 +5448,8 @@ app.post('/api/sd/txt2img', async (req, res) => {
     const workflow = String(req.body?.workflow || '').trim();
     const stepsNum = Number(req.body?.steps);
     const cfgNum = Number(req.body?.cfg);
+    const cameraAngle = String(req.body?.camera_angle || req.body?.pose_camera_angle || '').trim();
+    const poseTemplate = String(req.body?.pose_template || req.body?.template || '').trim();
     const body = {
       prompt,
       negative_prompt: negativePrompt,
@@ -4385,6 +5458,8 @@ app.post('/api/sd/txt2img', async (req, res) => {
       ...(workflow ? { workflow } : {}),
       ...(Number.isFinite(stepsNum) && stepsNum > 0 ? { steps: Math.round(stepsNum) } : {}),
       ...(Number.isFinite(cfgNum) && cfgNum > 0 ? { cfg: cfgNum } : {}),
+      ...(cameraAngle ? { camera_angle: cameraAngle } : {}),
+      ...(poseTemplate ? { pose_template: poseTemplate } : {}),
     };
     const r = await fetch(`${KNOWLEDGE_API_URL}/sd/txt2img`, {
       method: 'POST',
@@ -4412,8 +5487,16 @@ app.post('/api/sd/img2img', async (req, res) => {
     const filename = String(req.body?.filename || req.body?.upload_filename || '').trim();
     const poseImage = String(req.body?.pose_image || req.body?.pose_image_b64 || '').trim();
     const poseFilename = String(req.body?.pose_filename || req.body?.pose_upload_filename || '').trim();
-    const poseStrength = Number(req.body?.pose_strength);
-    const poseEndPercent = Number(req.body?.pose_end_percent);
+    // Forward Secret Menu Global settings (steps/cfg/size/pose). Do NOT forward
+    // likeness / pose_strength / pose_end_percent — backend bakes those; UI sliders
+    // historically diluted FaceID when this proxy passed weak values through.
+    const widthNum = Number(req.body?.width);
+    const heightNum = Number(req.body?.height);
+    const stepsNum = Number(req.body?.steps);
+    const cfgNum = Number(req.body?.cfg);
+    const seedNum = Number(req.body?.seed);
+    const cameraAngle = String(req.body?.camera_angle || req.body?.pose_camera_angle || '').trim();
+    const poseTemplate = String(req.body?.pose_template || req.body?.template || '').trim();
     const body = {
       prompt,
       init_image: initImage,
@@ -4422,8 +5505,17 @@ app.post('/api/sd/img2img', async (req, res) => {
       ...(filename ? { filename } : {}),
       ...(poseImage.length >= 80 ? { pose_image: poseImage } : {}),
       ...(poseFilename ? { pose_filename: poseFilename } : {}),
-      ...(Number.isFinite(poseStrength) ? { pose_strength: poseStrength } : {}),
-      ...(Number.isFinite(poseEndPercent) ? { pose_end_percent: poseEndPercent } : {}),
+      ...(Number.isFinite(widthNum) && widthNum >= 384
+        ? { width: Math.max(384, Math.min(1536, Math.round(widthNum))) }
+        : {}),
+      ...(Number.isFinite(heightNum) && heightNum >= 384
+        ? { height: Math.max(384, Math.min(1536, Math.round(heightNum))) }
+        : {}),
+      ...(Number.isFinite(stepsNum) && stepsNum > 0 ? { steps: Math.round(stepsNum) } : {}),
+      ...(Number.isFinite(cfgNum) && cfgNum > 0 ? { cfg: cfgNum } : {}),
+      ...(Number.isFinite(seedNum) && seedNum > 0 ? { seed: Math.round(seedNum) } : {}),
+      ...(cameraAngle ? { camera_angle: cameraAngle } : {}),
+      ...(poseTemplate ? { pose_template: poseTemplate } : {}),
     };
     if (req.body?.easy_prompt && typeof req.body.easy_prompt === 'object') {
       body.easy_prompt = req.body.easy_prompt;
@@ -4441,7 +5533,7 @@ app.post('/api/sd/img2img', async (req, res) => {
       const text = (await r.text()).slice(0, 400);
       const wrongApp =
         r.status === 404
-          ? `Knowledge API route missing on ${KNOWLEDGE_API_URL} (HTTP 404). Another app may be using port 8765 — run npm run dev:restart from the Butler repo.`
+          ? `Knowledge API route missing on ${KNOWLEDGE_API_URL} (HTTP 404). Another app may be using port 8765 ? run npm run dev:restart from the Butler repo.`
           : `Knowledge API returned non-JSON (HTTP ${r.status}). ${text.slice(0, 180)}`;
       return res.status(502).json({ ok: false, message: wrongApp, images: [] });
     }
@@ -4643,7 +5735,7 @@ function buildOriginalEpisodeSpecPrompt(userPrompt, opts) {
     '- Keep shot seconds between 3 and 12.',
     '- visual_prompt must be self-contained: characters + action + environment + camera + lighting + art style.',
     '- Dialogue lines must be short (<= 14 words each) for fast local rendering.',
-    '- Keep cast size 2–5.',
+    '- Keep cast size 2?5.',
     '',
     'USER_PROMPT:',
     String(userPrompt || '').slice(0, 4000),
@@ -4652,7 +5744,7 @@ function buildOriginalEpisodeSpecPrompt(userPrompt, opts) {
 
 function detectDisallowedIpRequest(text) {
   const s = String(text || '').toLowerCase();
-  // Keep this intentionally small; we’re not trying to police everything, just avoid direct “make X show” requests.
+  // Keep this intentionally small; we?re not trying to police everything, just avoid direct ?make X show? requests.
   const bad = [
     'rick and morty',
     'rick & morty',
@@ -4821,7 +5913,7 @@ async function runEpisodeJob(job) {
     await updateEpisodeJob(job.id, { log: log.slice(-80) });
   };
 
-  await logPush('Planning episode (LLM -> JSON spec)…');
+  await logPush('Planning episode (LLM -> JSON spec)?');
   let spec = null;
   try {
     if (detectDisallowedIpRequest(job.prompt)) {
@@ -4845,14 +5937,14 @@ async function runEpisodeJob(job) {
   const selected = shots.slice(0, maxShots);
   if (selected.length === 0) throw new Error('No shots generated');
 
-  await logPush(`Rendering ${selected.length} shot(s) via local video stack…`);
+  await logPush(`Rendering ${selected.length} shot(s) via local video stack?`);
   const clipPaths = [];
 
   for (let i = 0; i < selected.length; i++) {
     const sh = selected[i];
     const pct = Math.round((i / selected.length) * 100);
     await updateEpisodeJob(job.id, { progress: pct, stage: `render_shot_${i + 1}/${selected.length}` });
-    await logPush(`Shot ${i + 1}/${selected.length} ${sh.id}: generating clip…`);
+    await logPush(`Shot ${i + 1}/${selected.length} ${sh.id}: generating clip?`);
 
     const prompt = String(sh.visual_prompt || '').trim() || String(job.prompt || '').trim();
     // Retry a couple times; local video stacks can fail while models load.
@@ -4887,7 +5979,7 @@ async function runEpisodeJob(job) {
     await updateEpisodeJob(job.id, { last_clip_path: outClip });
   }
 
-  await logPush('Stitching clips…');
+  await logPush('Stitching clips?');
   await updateEpisodeJob(job.id, { stage: 'stitch', progress: 95 });
   const finalPath = path.join(jobDir, 'episode.mp4');
   await ffmpegConcatMp4({ inputs: clipPaths, outPath: finalPath });
@@ -4990,7 +6082,7 @@ app.post('/api/episode/queue', async (req, res) => {
 app.use('/api', (req, res) => {
   const hint =
     req.method === 'GET' && req.path === '/network-monitor/quick-scan'
-      ? 'Use POST with JSON body { seconds?, iface?, bpf? } (Settings → Network monitor → Scan).'
+      ? 'Use POST with JSON body { seconds?, iface?, bpf? } (Settings ? Network monitor ? Scan).'
       : undefined;
   res.status(404).json({
     ok: false,
@@ -4999,10 +6091,12 @@ app.use('/api', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
+/** Bind all interfaces so phones on LAN can reach the UI API. */
+const UI_API_BIND_HOST = String(process.env.BUTLER_UI_API_HOST || '0.0.0.0').trim() || '0.0.0.0';
+app.listen(PORT, UI_API_BIND_HOST, () => {
   const label = BUTLER_VARIANT === 'code-helper' ? 'Code Helper' : 'Butler';
   // eslint-disable-next-line no-console
-  console.log(`${label} UI API running at http://localhost:${PORT}`);
+  console.log(`${label} UI API running at http://${UI_API_BIND_HOST}:${PORT} (localhost + LAN)`);
   // Pre-connect knowledge/docs MCP defaults (Memory; Context7 only if CONTEXT7_API_KEY set).
   const defaults = getDefaultMcpServerConfigs().filter((s) => s.enabled);
   if (defaults.length) {

@@ -86,6 +86,8 @@ def summarize_data_locations() -> dict:
     audio_samples = get_audio_samples_dir()
     jtp = root / "job_tracker.json"
     profile_p = root / "profile.json"
+    user_mem_p = root / "user_memory.json"
+    codebase_map_p = root / "butler_codebase_map.json"
     comfy_p = root / "comfy_config.json"
     apt_txt = root / "apartment_listings_latest.txt"
     apt_json = root / "apartment_listings_latest.json"
@@ -166,6 +168,33 @@ def summarize_data_locations() -> dict:
             "count_label": "present",
         },
         {
+            "id": "users",
+            "label": "users/",
+            "detail": "Per-person profiles Butler remembers from voice/chat introductions (name-based recognition).",
+            "path": str(root / "users"),
+            "kind": "folder",
+            "count": _count_files(root / "users"),
+            "count_label": "user profiles",
+        },
+        {
+            "id": "user_memory",
+            "label": "user_memory.json",
+            "detail": "Personal facts Butler remembers from chat (name, pets, likes, people).",
+            "path": str(user_mem_p),
+            "kind": "file",
+            "count": 1 if user_mem_p.is_file() else 0,
+            "count_label": "present",
+        },
+        {
+            "id": "butler_codebase_map",
+            "label": "butler_codebase_map.json",
+              "detail": "Durable Self-edit codebase map (+ butler_codebase_rag.jsonl). Loads first on Self-edit asks; incremental mtime refresh when files change; full rebuild via Settings → Refresh index or after Accept of many files. Max age: BUTLER_CODEBASE_INDEX_MAX_AGE_DAYS (default 7).",
+            "path": str(codebase_map_p),
+            "kind": "file",
+            "count": 1 if codebase_map_p.is_file() else 0,
+            "count_label": "present",
+        },
+        {
             "id": "job_tracker",
             "label": "job_tracker.json",
             "detail": "Tracked applications and interview notes.",
@@ -210,6 +239,24 @@ def summarize_data_locations() -> dict:
             "count": (1 if (root / "gmail_credentials.json").is_file() else 0)
             + (1 if (root / "gmail_token.json").is_file() else 0),
             "count_label": "credential files",
+        },
+        {
+            "id": "spotify",
+            "label": "Spotify SEO playlists (optional)",
+            "detail": "spotify_token.json, spotify_seo_config.json, spotify_seo_playlists.json, artist_project.json",
+            "path": str(root),
+            "kind": "folder",
+            "count": sum(
+                1
+                for p in (
+                    root / "spotify_token.json",
+                    root / "spotify_seo_config.json",
+                    root / "spotify_seo_playlists.json",
+                    root / "artist_project.json",
+                )
+                if p.is_file()
+            ),
+            "count_label": "config files",
         },
         {
             "id": "gigs",

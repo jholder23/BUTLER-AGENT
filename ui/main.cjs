@@ -1098,7 +1098,7 @@ function buildComfyLaunchArgs() {
     } else {
       args.push(
         '--normalvram',
-        '--fp16-vae',
+        '--fp32-vae',
         '--disable-cuda-malloc',
         '--disable-pinned-memory',
       );
@@ -1107,7 +1107,7 @@ function buildComfyLaunchArgs() {
     args.push(...extraArgs);
   } else {
     // Dev Electron: light defaults; prefer start-comfyui-temp.bat when you need Wan lowvram.
-    args.push('--disable-cuda-malloc', '--fp16-vae', '--disable-pinned-memory');
+    args.push('--disable-cuda-malloc', '--fp32-vae', '--disable-pinned-memory');
   }
   return args;
 }
@@ -1812,7 +1812,28 @@ function waitForKnowledgeApi(maxMs = 8000) {
 
 async function startInternalApiServer() {
   const api = express();
-  api.use(cors());
+  /** Chrome Private Network Access: public HTTPS (Firebase) → localhost / LAN API. */
+  api.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    if (String(req.headers['access-control-request-private-network'] || '') === 'true') {
+      res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    }
+    next();
+  });
+  /** Open CORS for local SPA / Firebase Hosting / phone-on-LAN browsers. */
+  api.use(
+    cors({
+      origin: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Requested-With',
+        'Access-Control-Request-Private-Network',
+      ],
+      maxAge: 86400,
+    }),
+  );
   api.use(express.json({ limit: '80mb' }));
 
   api.get('/api/health', (_req, res) => {
@@ -3884,6 +3905,174 @@ async function startInternalApiServer() {
         }
       }
 
+      if (
+        parsed.mode === 'spotify_seo_create' ||
+        parsed.mode === 'spotify_seo_maintain' ||
+        parsed.mode === 'spotify_seo_cycle' ||
+        parsed.mode === 'spotify_seo_status'
+      ) {
+        const spotifyMode = parsed.mode;
+        const pathByMode = {
+          spotify_seo_status: '/spotify/status',
+          spotify_seo_create: '/spotify/seo/create',
+          spotify_seo_maintain: '/spotify/seo/maintain',
+          spotify_seo_cycle: '/spotify/seo/cycle',
+        };
+        const path = pathByMode[spotifyMode];
+        const isGet = spotifyMode === 'spotify_seo_status';
+        try {
+          const body = {
+            niche: parsed.niche || '',
+            niches: Array.isArray(parsed.niches) ? parsed.niches : undefined,
+            name: parsed.name || undefined,
+            keywords: parsed.keywords || undefined,
+            dry_run: !!parsed.dry_run,
+          };
+          const spRes = await fetch(LOCAL_AI_URL + path, {
+            method: isGet ? 'GET' : 'POST',
+            headers: isGet ? undefined : { 'Content-Type': 'application/json' },
+            body: isGet ? undefined : JSON.stringify(body),
+            signal: AbortSignal.timeout(120000),
+          });
+          const spData = await spRes.json().catch(() => ({}));
+          sessions.set(sessionId, session);
+          let reply =
+            (parsed.reply ? String(parsed.reply).trim() + '\n\n' : '') +
+            (spData.message || (spData.ok ? 'Done.' : 'Spotify SEO request failed.'));
+          if (spData.playlist && spData.playlist.url) {
+            reply += '\n' + spData.playlist.url;
+          }
+          if (Array.isArray(spData.playlists) && spData.playlists.length) {
+            const lines = spData.playlists
+              .slice(0, 12)
+              .map((p) => `- ${(p && p.name) || 'playlist'}: ${(p && p.url) || p.id || ''}`)
+              .join('\n');
+            reply += '\n\n' + lines;
+          }
+          if (!spData.ok && spData.connected === false) {
+            reply +=
+              '\n\nConnect Spotify: set SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET in .env, then run `npm run spotify:oauth` (or `python knowledge/spotify_oauth_setup.py`).';
+          }
+          learnCtx(reply);
+          try {
+            learnIntent(message, spotifyMode, {
+              niche: String(parsed.niche || '').slice(0, 120),
+            });
+          } catch (_) {}
+          return res.json({
+            reply,
+            source: 'Spotify SEO',
+            spotify: spData,
+          });
+        } catch (err) {
+          sessions.set(sessionId, session);
+          const fail =
+            'Spotify SEO request failed: ' +
+            String((err && err.message) || err).slice(0, 400) +
+            ' Ensure the Knowledge API is running.';
+          learnCtx(fail);
+          return res.json({ reply: fail, source: 'Spotify SEO' });
+        }
+      }
+
+      if (
+        parsed.mode === 'artist_project_show' ||
+        parsed.mode === 'artist_project_update' ||
+        parsed.mode === 'artist_project_sync'
+      ) {
+        const artMode = parsed.mode;
+        try {
+          let artRes;
+          if (artMode === 'artist_project_show') {
+            artRes = await fetch(LOCAL_AI_URL + '/artist/project', {
+              method: 'GET',
+              signal: AbortSignal.timeout(30000),
+            });
+          } else if (artMode === 'artist_project_sync') {
+            artRes = await fetch(LOCAL_AI_URL + '/artist/project/sync', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                source: parsed.source || 'all',
+                artist_id: parsed.artist_id || parsed.artistId || undefined,
+                force: !!parsed.force,
+              }),
+              signal: AbortSignal.timeout(120000),
+            });
+          } else {
+            const updates = {};
+            const keys = [
+              'artist_name',
+              'aliases',
+              'bio',
+              'tagline',
+              'location',
+              'genres',
+              'subgenres',
+              'moods',
+              'themes',
+              'keywords',
+              'seo_niches',
+              'similar_artists',
+              'collaborators',
+              'spotify_artist_ids',
+              'track_uris',
+              'track_titles',
+              'target_audience',
+              'brand_voice',
+              'do_not_associate',
+              'notes',
+              'bpm_ranges',
+              'cities',
+            ];
+            for (const k of keys) {
+              if (parsed[k] != null && parsed[k] !== '') updates[k] = parsed[k];
+            }
+            artRes = await fetch(LOCAL_AI_URL + '/artist/project', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(updates),
+              signal: AbortSignal.timeout(30000),
+            });
+          }
+          const artData = await artRes.json().catch(() => ({}));
+          sessions.set(sessionId, session);
+          const proj = artData.project || {};
+          let reply =
+            (parsed.reply ? String(parsed.reply).trim() + '\n\n' : '') +
+            (artData.message || (artData.ok ? 'Artist project updated.' : 'Artist project request failed.'));
+          if (proj.artist_name) reply += `\n\nArtist: ${proj.artist_name}`;
+          if (Array.isArray(proj.genres) && proj.genres.length) {
+            reply += `\nGenres: ${proj.genres.slice(0, 10).join(', ')}`;
+          }
+          if (Array.isArray(proj.seo_niches) && proj.seo_niches.length) {
+            reply += `\nSEO niches: ${proj.seo_niches.slice(0, 10).join(', ')}`;
+          }
+          if (Array.isArray(proj.keywords) && proj.keywords.length) {
+            reply += `\nKeywords: ${proj.keywords.slice(0, 12).join(', ')}`;
+          }
+          if (Array.isArray(proj.similar_artists) && proj.similar_artists.length) {
+            reply += `\nSimilar: ${proj.similar_artists.slice(0, 8).join(', ')}`;
+          }
+          if (Array.isArray(proj.track_titles) && proj.track_titles.length) {
+            reply += `\nTracks: ${proj.track_titles.slice(0, 10).join(', ')}`;
+          }
+          learnCtx(reply);
+          try {
+            learnIntent(message, artMode, { artist: String(proj.artist_name || '').slice(0, 80) });
+          } catch (_) {}
+          return res.json({ reply, source: 'Artist project', artist_project: artData });
+        } catch (err) {
+          sessions.set(sessionId, session);
+          const fail =
+            'Artist project request failed: ' +
+            String((err && err.message) || err).slice(0, 400) +
+            ' Ensure the Knowledge API is running.';
+          learnCtx(fail);
+          return res.json({ reply: fail, source: 'Artist project' });
+        }
+      }
+
       if (parsed.mode === 'print3d') {
         const desc = String(parsed.description || parsed.prompt || '').trim();
         if (!desc) {
@@ -4642,6 +4831,32 @@ async function startInternalApiServer() {
     }
   });
 
+  api.get('/api/agent/cascade-status', async (req, res) => {
+    try {
+      const provider = String(req.query.provider || req.query.selected || 'auto_free').trim() || 'auto_free';
+      const probe = String(req.query.probe || '').trim().toLowerCase();
+      const qs = `provider=${encodeURIComponent(provider)}${probe === '1' || probe === 'true' ? '&probe=1' : ''}`;
+      const proxied = await proxyKnowledgeAgentJsonElectron('GET', `/agent/cascade-status?${qs}`);
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.post('/api/agent/cascade-status', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const proxied = await proxyKnowledgeAgentJsonElectron('POST', '/agent/cascade-status', {
+        provider: body.provider || body.selected || 'auto_free',
+        api_keys: body.api_keys || body.apiKeys || {},
+        probe: true,
+      });
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
   api.get('/api/agent/checkpoints', async (req, res) => {
     try {
       const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
@@ -5371,10 +5586,17 @@ async function startInternalApiServer() {
   return new Promise((resolve, reject) => {
     const maxRetries = app.isPackaged ? 7 : 0;
     const tryListen = (port, remaining) => {
-      const server = api.listen(port, () => {
+      const bindHost = String(process.env.BUTLER_UI_API_HOST || '0.0.0.0').trim() || '0.0.0.0';
+      const server = api.listen(port, bindHost, () => {
         API_PORT = port;
         process.env.BUTLER_UI_API_PORT = String(API_PORT);
-        console.log('Butler internal server running at http://localhost:' + API_PORT);
+        console.log(
+          'Butler internal server running at http://' +
+            bindHost +
+            ':' +
+            API_PORT +
+            ' (localhost + LAN)',
+        );
         resolve(server);
       });
       server.on('error', (err) => {

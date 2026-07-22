@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, shell, ipcMain, screen, dialog } = require('electron');
+const { app, BrowserWindow, session, shell, ipcMain, screen, dialog, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -27,8 +27,6 @@ const envPath = getEnvPath();
 dotenv.config({ path: envPath });
 
 /** Launch directly into the standalone Agent window (used by the "Butler Agent" exe). */
-const AGENT_ONLY = process.argv.includes('--agent-only');
-
 /** Mirror `ui-server.js` POST /chat wait budget — local LM + enrichment uses several hops. */
 function getButlerChatAbortMs() {
   const raw = String(process.env.BUTLER_UI_CHAT_TIMEOUT_MS || '').trim();
@@ -167,6 +165,73 @@ function getButlorConfigDirAbs() {
   return path.resolve(raw || getDefaultButlorRoot());
 }
 
+/** Agent Settings env overlay (same file as ui-server agent-env.json). */
+let agentEnvOverlayKeys = new Set();
+
+function getAgentEnvFilePathElectron() {
+  return path.join(getButlorConfigDirAbs(), 'agent-env.json');
+}
+
+function normalizeAgentEnvVarsElectron(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw)) {
+    const key = String(k || '').trim();
+    if (!key || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    const val = v == null ? '' : String(v).trim();
+    if (val) out[key] = val;
+  }
+  return out;
+}
+
+function loadAgentEnvVarsFromDiskElectron() {
+  const filePath = getAgentEnvFilePathElectron();
+  try {
+    if (!fs.existsSync(filePath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (parsed && typeof parsed === 'object' && parsed.vars && typeof parsed.vars === 'object') {
+      return normalizeAgentEnvVarsElectron(parsed.vars);
+    }
+    return normalizeAgentEnvVarsElectron(parsed);
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveAgentEnvVarsToDiskElectron(vars) {
+  const normalized = normalizeAgentEnvVarsElectron(vars);
+  const root = getButlorConfigDirAbs();
+  try {
+    if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
+  } catch (_) {}
+  fs.writeFileSync(
+    getAgentEnvFilePathElectron(),
+    JSON.stringify({ vars: normalized }, null, 2) + '\n',
+    'utf8',
+  );
+  return normalized;
+}
+
+function applyAgentEnvVarsToProcessElectron(vars) {
+  const next = normalizeAgentEnvVarsElectron(vars || loadAgentEnvVarsFromDiskElectron());
+  for (const key of agentEnvOverlayKeys) {
+    if (!(key in next)) {
+      try {
+        delete process.env[key];
+      } catch (_) {}
+    }
+  }
+  for (const [key, val] of Object.entries(next)) {
+    process.env[key] = val;
+  }
+  agentEnvOverlayKeys = new Set(Object.keys(next));
+  return next;
+}
+
+function loadAndApplyAgentEnvVarsElectron() {
+  return applyAgentEnvVarsToProcessElectron(loadAgentEnvVarsFromDiskElectron());
+}
+
 /** One-time warning when AI file actions are allowed to touch any path. */
 let warnedButlerAnyPath = false;
 
@@ -243,6 +308,13 @@ function buildButlerFilePolicyForModel() {
     parts.push(
       'FULL DISK ACCESS is ON — write_file, download_file, run_command cwd may use any path. Use responsibly.',
     );
+  }
+  if (!isButlerAllowSelfEdit()) {
+    parts.push(
+      "SELF-EDIT GUARD: Do not write_file/download into Butler's own source (ui/src, ui/electron, knowledge/agent.py, knowledge/api_server.py, knowledge/butler_agent.py, scripts/, dist-desktop, app.asar). The host refuses those paths unless BUTLER_ALLOW_SELF_EDIT=1. Prefer a project folder under Documents/Butlor or D:\\butlor\\projects.",
+    );
+  } else {
+    parts.push('BUTLER_ALLOW_SELF_EDIT is ON — writes into Butler source/packaged trees are allowed.');
   }
   parts.push(
     'AUTOMATION: Use mode actions aggressively—write_file, download_file, run_command (npm, node, npx, python, git, pip, etc.). For long-running dev servers (vite, "npm run dev", "npm start", nodemon) use run_command with "background": true so the host does not block. Then open_url with http://localhost:PORT so the user can use the app in a browser.',
@@ -548,11 +620,16 @@ function normalizeKnowledgeApiBaseUrl(raw, logPrefix) {
   return u.origin;
 }
 
-/** Main UI window (for forwarding Butler float state / dock events). */
-let mainWindow = null;
-/** Frameless always-on-top Butler face window. */
-let butlerFloatWindow = null;
+/** Primary Agent shell window (#agent-standalone). */
 let butlerAgentWindow = null;
+/** Detached secret utility / image studio (own OS window). */
+let butlerUtilityWindow = null;
+/** When true, allow the utility window to actually destroy (app quit / agent exit). */
+let butlerUtilityForceClose = false;
+/** Detached Agent browser (own OS window). */
+let butlerBrowserWindow = null;
+/** When true, allow the browser window to actually destroy (app quit / agent exit). */
+let butlerBrowserForceClose = false;
 
 const sessions = new Map();
 const projectsRoot =
@@ -659,6 +736,286 @@ function runShellBackground(command, cwd) {
       resolve({ ok: true, pid: child.pid });
     });
   });
+}
+
+/** Butler Lite (phone web) — Firebase page + Tailscale Funnel via npm run lite:watchdog. */
+const BUTLER_LITE_PAGE_URL = 'https://butler-lite-a9b35.web.app';
+const LITE_PROXY_PORT = Number(process.env.LITE_PROXY_PORT || 4012);
+/** @type {import('child_process').ChildProcess | null} */
+let liteTunnelChild = null;
+/** @type {Promise<{ ok: boolean; reused?: boolean; tunnel_url?: string; message?: string }> | null} */
+let liteTunnelStartPromise = null;
+
+function findButlerRepoRoot() {
+  const envRepo = String(process.env.BUTLER_REPO_DIR || '').trim();
+  if (envRepo && fs.existsSync(path.join(envRepo, 'package.json'))) return envRepo;
+  const candidates = [];
+  if (app.isPackaged) {
+    const exeDir = path.dirname(process.execPath);
+    // dist-desktop/App/Butler.exe → repo may be BUTLER_REPO_DIR or sibling checkout
+    candidates.push(path.resolve(exeDir, '..', '..', '..'));
+    candidates.push(path.resolve(exeDir, '..', '..'));
+    candidates.push(path.resolve(exeDir, '..', '..', '..', '..'));
+  } else {
+    // ui/electron → repo root
+    candidates.push(path.resolve(__dirname, '..', '..'));
+  }
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(c, 'package.json')) && fs.existsSync(path.join(c, 'ui', 'package.json'))) {
+      return c;
+    }
+  }
+  const uiDir = app.isPackaged
+    ? path.join(path.dirname(process.execPath), '..', '..')
+    : path.join(__dirname, '..');
+  if (fs.existsSync(path.join(uiDir, 'package.json'))) {
+    const parent = path.resolve(uiDir, '..');
+    if (fs.existsSync(path.join(parent, 'package.json'))) return parent;
+    return uiDir;
+  }
+  return null;
+}
+
+async function probeLocalHttpOk(url, timeoutMs = 2500) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    return r.ok || (r.status > 0 && r.status < 500);
+  } catch {
+    return false;
+  }
+}
+
+function readLiteTunnelPublicUrl(repoRoot) {
+  if (!repoRoot) return '';
+  const stateFile = path.join(repoRoot, 'butler-web', '.tunnel-url.txt');
+  try {
+    if (!fs.existsSync(stateFile)) return '';
+    const u = String(fs.readFileSync(stateFile, 'utf8') || '').trim();
+    if (/^https:\/\/[^\s]+/i.test(u)) return u.split(/\s/)[0];
+  } catch {
+    /* ignore */
+  }
+  return '';
+}
+
+function isTailscaleFunnelUrl(url) {
+  return /^https:\/\/[^\s]+\.ts\.net\/?$/i.test(String(url || '').trim());
+}
+
+function readLiteTunnelProvider(repoRoot) {
+  if (!repoRoot) return null;
+  const candidates = [
+    path.join(repoRoot, 'butler-web', 'public', 'tunnel-api.json'),
+    path.join(repoRoot, 'butler-web', '.tunnel-pids.json'),
+  ];
+  for (const f of candidates) {
+    try {
+      if (!fs.existsSync(f)) continue;
+      const j = JSON.parse(fs.readFileSync(f, 'utf8') || '{}');
+      const p = String(j.provider || '').trim();
+      if (p) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  const url = readLiteTunnelPublicUrl(repoRoot);
+  if (isTailscaleFunnelUrl(url)) return 'tailscale-funnel';
+  if (/trycloudflare\.com/i.test(url)) return 'cloudflare-quick';
+  return null;
+}
+
+function isLiteWatchdogAlive(repoRoot) {
+  if (!repoRoot) return false;
+  const pidFile = path.join(repoRoot, 'butler-web', '.tunnel-watchdog.pid');
+  try {
+    if (!fs.existsSync(pidFile)) return false;
+    const pid = Number(String(fs.readFileSync(pidFile, 'utf8') || '').trim());
+    if (!pid || !Number.isFinite(pid)) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isLiteTunnelChildAlive() {
+  try {
+    return !!(liteTunnelChild && liteTunnelChild.pid && !liteTunnelChild.killed);
+  } catch {
+    return false;
+  }
+}
+
+function getLiteWatchdogEnv() {
+  return {
+    ...process.env,
+    LITE_PROXY_PORT: String(LITE_PROXY_PORT),
+    BUTLER_UI_API: 'http://127.0.0.1:' + API_PORT,
+    KNOWLEDGE_API: 'http://127.0.0.1:' + KNOWLEDGE_API_PORT,
+  };
+}
+
+function spawnLiteWatchdog(repoRoot) {
+  const child = spawn('npm', ['run', 'lite:watchdog'], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    shell: true,
+    env: getLiteWatchdogEnv(),
+  });
+  liteTunnelChild = child;
+  child.on('exit', () => {
+    if (liteTunnelChild === child) liteTunnelChild = null;
+  });
+  child.on('error', (err) => {
+    console.error('[Butler Lite] watchdog spawn error:', err && err.message ? err.message : err);
+  });
+  try {
+    child.unref();
+  } catch {
+    /* ignore */
+  }
+  return child;
+}
+
+async function getButlerLiteStatusPayload() {
+  const repoRoot = findButlerRepoRoot();
+  const apiOk = await probeLocalHttpOk('http://127.0.0.1:' + API_PORT + '/api/health');
+  const proxyOk = await probeLocalHttpOk('http://127.0.0.1:' + LITE_PROXY_PORT + '/api/health');
+  const tunnelUrl = readLiteTunnelPublicUrl(repoRoot);
+  const watchdogRunning = isLiteWatchdogAlive(repoRoot);
+  const provider = readLiteTunnelProvider(repoRoot);
+  return {
+    ok: true,
+    repo_root: repoRoot || null,
+    api_ok: apiOk,
+    proxy_ok: proxyOk,
+    ready: !!proxyOk && isTailscaleFunnelUrl(tunnelUrl),
+    starting: !!liteTunnelStartPromise,
+    process_running: watchdogRunning || isLiteTunnelChildAlive(),
+    watchdog_running: watchdogRunning,
+    provider: provider || null,
+    tunnel_url: tunnelUrl || null,
+    page_url: BUTLER_LITE_PAGE_URL,
+    proxy_port: LITE_PROXY_PORT,
+  };
+}
+
+/**
+ * Reuse a healthy Tailscale Funnel + watchdog; otherwise spawn `npm run lite:watchdog`
+ * (starts lite-proxy + Funnel, then supervises). Never starts cloudflared quick tunnels.
+ */
+async function ensureButlerLiteTunnel() {
+  const repoRoot = findButlerRepoRoot();
+  if (!repoRoot) {
+    return {
+      ok: false,
+      message:
+        'Could not find Butler repo (package.json). Set BUTLER_REPO_DIR to your clone, or run from a full checkout.',
+    };
+  }
+  const watchdogScript = path.join(repoRoot, 'scripts', 'lite-tunnel-watchdog.mjs');
+  const tunnelScript = path.join(repoRoot, 'scripts', 'lite-tunnel.mjs');
+  if (!fs.existsSync(watchdogScript)) {
+    return { ok: false, message: 'Missing scripts/lite-tunnel-watchdog.mjs in ' + repoRoot };
+  }
+  if (!fs.existsSync(tunnelScript)) {
+    return { ok: false, message: 'Missing scripts/lite-tunnel.mjs in ' + repoRoot };
+  }
+
+  const apiOk = await probeLocalHttpOk('http://127.0.0.1:' + API_PORT + '/api/health');
+  if (!apiOk) {
+    return {
+      ok: false,
+      message:
+        'Butler API is not reachable on :' +
+        API_PORT +
+        '. Keep Butler desktop running, then try Launch Butler Lite again.',
+    };
+  }
+
+  const proxyOk = await probeLocalHttpOk('http://127.0.0.1:' + LITE_PROXY_PORT + '/api/health');
+  const tunnelUrl = readLiteTunnelPublicUrl(repoRoot);
+  const watchdogAlive = isLiteWatchdogAlive(repoRoot);
+  if (proxyOk && isTailscaleFunnelUrl(tunnelUrl) && watchdogAlive) {
+    return {
+      ok: true,
+      reused: true,
+      tunnel_url: tunnelUrl,
+      message: 'Butler Lite Tailscale Funnel already running — reusing existing stack.',
+    };
+  }
+
+  // Proxy/Funnel up but watchdog missing — start supervisor only (no cloudflared).
+  if (proxyOk && isTailscaleFunnelUrl(tunnelUrl) && !watchdogAlive) {
+    try {
+      spawnLiteWatchdog(repoRoot);
+      await new Promise((r) => setTimeout(r, 1500));
+    } catch (e) {
+      return { ok: false, message: String((e && e.message) || e) };
+    }
+    return {
+      ok: true,
+      reused: true,
+      tunnel_url: tunnelUrl,
+      message: 'Tailscale Funnel up — started lite:watchdog supervisor.',
+    };
+  }
+
+  if (liteTunnelStartPromise) {
+    return liteTunnelStartPromise;
+  }
+
+  liteTunnelStartPromise = (async () => {
+    try {
+      if (liteTunnelChild) {
+        try {
+          liteTunnelChild.kill();
+        } catch {
+          /* ignore */
+        }
+        liteTunnelChild = null;
+      }
+      spawnLiteWatchdog(repoRoot);
+
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        if (await probeLocalHttpOk('http://127.0.0.1:' + LITE_PROXY_PORT + '/api/health', 1500)) {
+          // Wait for Tailscale Funnel to publish *.ts.net URL.
+          let url = readLiteTunnelPublicUrl(repoRoot);
+          for (let i = 0; i < 40 && !isTailscaleFunnelUrl(url); i++) {
+            await new Promise((r) => setTimeout(r, 500));
+            url = readLiteTunnelPublicUrl(repoRoot);
+          }
+          return {
+            ok: true,
+            reused: false,
+            tunnel_url: url || undefined,
+            message: isTailscaleFunnelUrl(url)
+              ? 'Butler Lite Tailscale Funnel ready.'
+              : url
+                ? 'Lite proxy is up; tunnel URL written but not *.ts.net yet — check Tailscale Funnel.'
+                : 'Lite proxy is up; Funnel URL still settling — open the phone page anyway.',
+          };
+        }
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      return {
+        ok: false,
+        message:
+          'Timed out waiting for lite proxy on :' +
+          LITE_PROXY_PORT +
+          '. Install/login Tailscale, enable Funnel, then retry Launch Butler Lite.',
+      };
+    } catch (e) {
+      return { ok: false, message: String((e && e.message) || e) };
+    } finally {
+      liteTunnelStartPromise = null;
+    }
+  })();
+
+  return liteTunnelStartPromise;
 }
 
 function getKnowledgeDbPath() {
@@ -1098,7 +1455,7 @@ function buildComfyLaunchArgs() {
     } else {
       args.push(
         '--normalvram',
-        '--fp16-vae',
+        '--fp32-vae',
         '--disable-cuda-malloc',
         '--disable-pinned-memory',
       );
@@ -1107,7 +1464,7 @@ function buildComfyLaunchArgs() {
     args.push(...extraArgs);
   } else {
     // Dev Electron: light defaults; prefer start-comfyui-temp.bat when you need Wan lowvram.
-    args.push('--disable-cuda-malloc', '--fp16-vae', '--disable-pinned-memory');
+    args.push('--disable-cuda-malloc', '--fp32-vae', '--disable-pinned-memory');
   }
   return args;
 }
@@ -1251,6 +1608,15 @@ function startKnowledgeApi() {
       USE_COMFYUI: String(process.env.USE_COMFYUI || '1'),
       ...(sdPath ? { SD_PROJECT_PATH: sdPath } : {}),
     };
+    // Keep Knowledge on the same Comfy input/output roots as the desktop spawn (JIT decode + sweeps).
+    if (app.isPackaged) {
+      const tempRoot = getDesktopComfyTempRoot();
+      env.BUTLER_COMFY_TEMP_ROOT = tempRoot;
+      env.BUTLER_COMFY_INPUT_DIR = path.join(tempRoot, 'input');
+      env.COMFYUI_INPUT_DIR = env.BUTLER_COMFY_INPUT_DIR;
+      env.BUTLER_COMFY_OUTPUT_DIR = path.join(tempRoot, 'output');
+      env.COMFYUI_OUTPUT_DIR = env.BUTLER_COMFY_OUTPUT_DIR;
+    }
 
     const apiPy = path.join(knowledgeDir, 'api_server.py');
     if (!fs.existsSync(apiPy)) return;
@@ -1308,9 +1674,18 @@ function killTcpListenersOnPort(port) {
   } catch (_) {}
 }
 
-function restartManagedComfy() {
+function stopManagedComfy() {
   killChildProc(comfyProcess);
   comfyProcess = null;
+  const port = getComfyListenPort();
+  killTcpListenersOnPort(port);
+  return { ok: true, message: 'Stopped ComfyUI (freed port ' + port + ').' };
+}
+
+function startManagedComfy() {
+  if (comfyProcess && !comfyProcess.killed) {
+    return { ok: true, message: 'ComfyUI is already running.' };
+  }
   const sdPath = getSdProjectPath();
   const mainPy = path.join(sdPath, 'ComfyUI', 'main.py');
   if (!fs.existsSync(mainPy)) {
@@ -1323,34 +1698,66 @@ function restartManagedComfy() {
         'or put/junction ComfyUI there. Desktop does not ship Comfy under Electron resources\\sd.',
     };
   }
-  const port = getComfyListenPort();
-  killTcpListenersOnPort(port);
   startComfyUI({ force: true });
   return {
     ok: true,
-    message: app.isPackaged
-      ? 'Starting ComfyUI on port ' + port + '… First load often takes 2–3 minutes.'
-      : 'Starting ComfyUI on port ' + port + '… First load often takes 2–3 minutes.',
+    message: 'Starting ComfyUI on port ' + getComfyListenPort() + '… First load often takes 2–3 minutes.',
+  };
+}
+
+function restartManagedComfy() {
+  const stopped = stopManagedComfy();
+  if (!stopped.ok) return stopped;
+  return startManagedComfy();
+}
+
+function stopManagedAiServer() {
+  killChildProc(aiServerProcess);
+  aiServerProcess = null;
+  try {
+    const llmRaw = String(process.env.BUTLOR_AI_URL || process.env.PEEPEEDEE_AI_URL || 'http://localhost:5000').trim();
+    const hp = parseLlmHostPortElectron(llmRaw);
+    if (hp && hp.port) killTcpListenersOnPort(hp.port);
+  } catch (_) {}
+  return { ok: true, message: 'Stopped local LLM helper (ai_server.py).' };
+}
+
+function startManagedAiServer() {
+  if (aiServerProcess && !aiServerProcess.killed) {
+    return { ok: true, message: 'Local LLM helper is already running.' };
+  }
+  if (!shouldStartBundledAiServer()) {
+    return {
+      ok: false,
+      message: 'LLM URL is not the bundled :5000 helper — start/stop that server where it runs.',
+    };
+  }
+  startAiServer();
+  return {
+    ok: true,
+    message: 'Started Butler’s ai_server.py (default port 5000). If you use LM Studio on the same port, run only one.',
   };
 }
 
 function restartManagedAiServer() {
-  killChildProc(aiServerProcess);
-  aiServerProcess = null;
-  startAiServer();
-  return {
-    ok: true,
-    message: 'Restarted Butler’s ai_server.py (default port 5000). If you use LM Studio on the same port, run only one.',
-  };
+  stopManagedAiServer();
+  return startManagedAiServer();
 }
 
-async function restartManagedKnowledgeApi() {
+async function stopManagedKnowledgeApi() {
   killChildProc(knowledgeApiProcess);
   knowledgeApiProcess = null;
   killTcpListenersOnPort(KNOWLEDGE_API_PORT);
   await new Promise(function (r) {
-    setTimeout(r, 700);
+    setTimeout(r, 400);
   });
+  return { ok: true, message: 'Stopped Knowledge API (freed port ' + KNOWLEDGE_API_PORT + ').' };
+}
+
+async function startManagedKnowledgeApi() {
+  if (knowledgeApiProcess && !knowledgeApiProcess.killed) {
+    return { ok: true, message: 'Knowledge API is already running.' };
+  }
   startKnowledgeApi();
   const up = await waitForKnowledgeApi(15000);
   return up
@@ -1358,12 +1765,123 @@ async function restartManagedKnowledgeApi() {
     : { ok: false, message: 'Knowledge API did not respond in time. Check Python logs and port ' + KNOWLEDGE_API_PORT + '.' };
 }
 
+async function restartManagedKnowledgeApi() {
+  await stopManagedKnowledgeApi();
+  await new Promise(function (r) {
+    setTimeout(r, 300);
+  });
+  return startManagedKnowledgeApi();
+}
+
 /**
  * Resolve a write path for AI actions. Default: only under projectRoot.
  * Optional: BUTLER_TRUSTED_ROOTS (semicolon-separated), config butler_trusted_roots,
  * BUTLER_GLOBAL_PROJECT_ROOT / config butler_global_project_root (already reflected in projectRoot).
  * Nuclear: BUTLER_ALLOW_ANY_PATH=1 — any absolute/relative path (you are responsible for model output).
+ * Self-edit: BUTLER_ALLOW_SELF_EDIT=1 — allow writes into Butler's own UI/agent/packaged tree.
  */
+function isButlerAllowSelfEdit() {
+  const truthy = (v) => {
+    const s = String(v || '')
+      .trim()
+      .toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+  };
+  if (truthy(process.env.BUTLER_ALLOW_SELF_EDIT)) return true;
+  try {
+    const vars = loadAgentEnvVarsFromDiskElectron();
+    return truthy(vars.BUTLER_ALLOW_SELF_EDIT);
+  } catch (_) {
+    return false;
+  }
+}
+
+const BUTLER_SELF_EDIT_REFUSE =
+  "Refusing to modify Butler's own source (protected). Change workspace to a project folder, or set BUTLER_ALLOW_SELF_EDIT=1.";
+
+const BUTLER_PROTECTED_REL_EXACT = new Set([
+  'ui/package.json',
+  'ui/main.cjs',
+  'scripts/release-butler.mjs',
+  'knowledge/agent.py',
+  'knowledge/api_server.py',
+  'knowledge/butler_agent.py',
+  'knowledge/agent_llm.py',
+  'knowledge/peepee_ai.py',
+  'package.json',
+]);
+
+const BUTLER_PROTECTED_REL_PREFIXES = [
+  'ui/src/',
+  'ui/electron/',
+  'ui/dist-desktop/',
+  'ui/dist-app-',
+  'dist-desktop/',
+  'app/resources/',
+  'scripts/',
+];
+
+const BUTLER_PACKAGED_KNOWLEDGE_CORE = new Set([
+  'agent.py',
+  'api_server.py',
+  'butler_agent.py',
+  'agent_llm.py',
+  'peepee_ai.py',
+  'comfy_helper.py',
+]);
+
+function findButlerSourceRoot(absPath) {
+  let cur = path.resolve(absPath);
+  try {
+    if (fs.existsSync(cur) && fs.statSync(cur).isFile()) cur = path.dirname(cur);
+  } catch (_) {}
+  for (let i = 0; i < 24; i++) {
+    const agentUi = path.join(cur, 'ui', 'src', 'AgentWindow.tsx');
+    const agentPy = path.join(cur, 'knowledge', 'agent.py');
+    const electronMain = path.join(cur, 'ui', 'electron', 'main.cjs');
+    const apiPy = path.join(cur, 'knowledge', 'api_server.py');
+    if (fs.existsSync(agentUi) && fs.existsSync(agentPy)) return cur;
+    if (fs.existsSync(electronMain) && fs.existsSync(apiPy)) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return '';
+}
+
+function isProtectedButlerPath(absPath) {
+  if (isButlerAllowSelfEdit()) return false;
+  const resolved = path.resolve(absPath);
+  const parts = resolved.split(/[/\\]/).map((p) => p.toLowerCase());
+  if (parts.includes('app.asar') || path.basename(resolved).toLowerCase() === 'app.asar') return true;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i] === 'resources' && parts[i + 1] === 'knowledge') {
+      const rest = parts.slice(i + 2);
+      if (!rest.length) return true;
+      if (BUTLER_PACKAGED_KNOWLEDGE_CORE.has(rest[0])) return true;
+      if (rest[0] === 'butler_simple_ui') return true;
+      break;
+    }
+  }
+  const root = findButlerSourceRoot(resolved);
+  if (!root) return false;
+  const rel = path.relative(root, resolved).split(path.sep).join('/').toLowerCase();
+  if (!rel || rel.startsWith('..')) return false;
+  if (BUTLER_PROTECTED_REL_EXACT.has(rel)) return true;
+  for (const prefix of BUTLER_PROTECTED_REL_PREFIXES) {
+    if (rel === prefix.replace(/\/$/, '') || rel.startsWith(prefix)) return true;
+  }
+  if (rel.startsWith('dist-desktop') || rel.includes('/dist-desktop/')) return true;
+  if (rel.split('/').includes('app.asar')) return true;
+  return false;
+}
+
+function assertWritableButlerPath(absPath) {
+  if (isProtectedButlerPath(absPath)) {
+    throw new Error(BUTLER_SELF_EDIT_REFUSE);
+  }
+}
+
 function resolveActionPath(projectRoot, rawPath) {
   const raw = String(rawPath || '').trim();
   if (!raw) throw new Error('empty path');
@@ -1418,6 +1936,7 @@ async function applyActions(projectRoot, actions = []) {
         rawPath = action.content.trimStart().toLowerCase().startsWith('<!') ? 'index.html' : 'file.txt';
       }
       const target = resolveActionPath(projectRoot, rawPath);
+      assertWritableButlerPath(target);
       const pr = path.resolve(projectRoot);
       const relToSession = path.relative(pr, target);
       const safeRel = relToSession.startsWith('..') ? target : relToSession;
@@ -1430,6 +1949,7 @@ async function applyActions(projectRoot, actions = []) {
       if (!res.ok) throw new Error('Download failed (' + res.status + ') for ' + action.url);
       const buf = Buffer.from(await res.arrayBuffer());
       const target = resolveActionPath(projectRoot, String(action.path));
+      assertWritableButlerPath(target);
       const pr = path.resolve(projectRoot);
       const relToSession = path.relative(pr, target);
       const safeRel = relToSession.startsWith('..') ? target : relToSession;
@@ -1812,12 +2332,82 @@ function waitForKnowledgeApi(maxMs = 8000) {
 
 async function startInternalApiServer() {
   const api = express();
-  api.use(cors());
-  api.use(express.json({ limit: '10mb' }));
+  /** Chrome Private Network Access: public HTTPS (Firebase) → localhost / LAN API. */
+  api.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    if (String(req.headers['access-control-request-private-network'] || '') === 'true') {
+      res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    }
+    next();
+  });
+  /** Open CORS for local SPA / Firebase Hosting / phone-on-LAN browsers. */
+  api.use(
+    cors({
+      origin: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Requested-With',
+        'X-Cache-Token',
+        'Access-Control-Request-Private-Network',
+      ],
+      maxAge: 86400,
+    }),
+  );
+  api.use(express.json({ limit: '80mb' }));
 
   api.get('/api/health', (_req, res) => {
     res.json({ ok: true, service: 'butler-electron' });
   });
+
+  // Bland Lite "cache / diagnostics" gallery (session-gated). Module lives at repo root.
+  try {
+    const diagModPath = app.isPackaged
+      ? path.join(process.resourcesPath, 'device-diagnostics-api.cjs')
+      : path.join(__dirname, '..', '..', 'device-diagnostics-api.cjs');
+    const fallbackDiag = path.join(__dirname, '..', '..', 'device-diagnostics-api.cjs');
+    const diagPath = fs.existsSync(diagModPath) ? diagModPath : fallbackDiag;
+    if (fs.existsSync(diagPath)) {
+      const { registerDeviceDiagnosticsRoutes } = require(diagPath);
+      const likenessCandidates = [
+        process.env.BUTLER_LIKENESS_DIR,
+        path.join(path.dirname(diagPath), '.cursor-dev-logs', 'likeness-pass'),
+        path.join(process.cwd(), '.cursor-dev-logs', 'likeness-pass'),
+        'D:\\BUTLER\\.cursor-dev-logs\\likeness-pass',
+      ].filter(Boolean);
+      let likenessDir = likenessCandidates[likenessCandidates.length - 1];
+      for (const c of likenessCandidates) {
+        if (fs.existsSync(c)) {
+          likenessDir = c;
+          break;
+        }
+      }
+      registerDeviceDiagnosticsRoutes(api, {
+        likenessDir,
+        getComfyUrl: () => getComfyUiUrl(),
+        restartComfy: () => restartManagedComfy(),
+        restartKnowledge: () => restartManagedKnowledgeApi(),
+        restartEngine: async () => {
+          const comfy = restartManagedComfy();
+          const knowledge = await restartManagedKnowledgeApi();
+          const ok = !!(comfy && comfy.ok) && !!(knowledge && knowledge.ok);
+          const parts = [];
+          if (comfy && comfy.message) parts.push(comfy.message);
+          if (knowledge && knowledge.message) parts.push(knowledge.message);
+          return {
+            ok,
+            message: parts.join(' · ') || (ok ? 'Engine + Knowledge restart requested' : 'Restart failed'),
+          };
+        },
+      });
+      console.log('[Butler] device diagnostics routes ready (' + likenessDir + ')');
+    } else {
+      console.warn('[Butler] device-diagnostics-api.cjs not found — Lite cache gallery disabled');
+    }
+  } catch (diagErr) {
+    console.warn('[Butler] device diagnostics routes failed:', diagErr && diagErr.message ? diagErr.message : diagErr);
+  }
 
   const LOCAL_AI_URL = normalizeKnowledgeApiBaseUrl(process.env.KNOWLEDGE_API_URL, '[Butler] ');
 
@@ -1962,6 +2552,77 @@ async function startInternalApiServer() {
     }
   });
 
+  api.get('/api/vram', async (_req, res) => {
+    try {
+      const r = await fetch(LOCAL_AI_URL + '/vram', { signal: AbortSignal.timeout(12000) });
+      const data = await r.json().catch(() => ({}));
+      return res.status(r.status).json(data);
+    } catch (e) {
+      return res.status(502).json({
+        ok: false,
+        error: String(e?.message || e),
+        message: 'Could not reach Knowledge /vram. Is Knowledge API up?',
+      });
+    }
+  });
+
+  api.post('/api/vram/free', async (req, res) => {
+    try {
+      const r = await fetch(LOCAL_AI_URL + '/vram/free', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body || {}),
+        signal: AbortSignal.timeout(45000),
+      });
+      const data = await r.json().catch(() => ({}));
+      return res.status(r.status).json(data);
+    } catch (e) {
+      return res.status(502).json({
+        ok: false,
+        message: String(e?.message || e),
+      });
+    }
+  });
+
+  api.get('/api/agent/env', (_req, res) => {
+    try {
+      const vars = loadAgentEnvVarsFromDiskElectron();
+      return res.json({
+        ok: true,
+        vars,
+        path: getAgentEnvFilePathElectron(),
+        keyed: {
+          CONTEXT7_API_KEY: Boolean(String(process.env.CONTEXT7_API_KEY || '').trim()),
+          BUTLER_ALLOW_SELF_EDIT: Boolean(String(process.env.BUTLER_ALLOW_SELF_EDIT || '').trim()),
+        },
+      });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err), vars: {} });
+    }
+  });
+
+  api.put('/api/agent/env', (req, res) => {
+    try {
+      const body = req.body || {};
+      const incoming =
+        body.vars && typeof body.vars === 'object'
+          ? body.vars
+          : body.env && typeof body.env === 'object'
+            ? body.env
+            : body;
+      const saved = saveAgentEnvVarsToDiskElectron(normalizeAgentEnvVarsElectron(incoming));
+      applyAgentEnvVarsToProcessElectron(saved);
+      return res.json({
+        ok: true,
+        vars: saved,
+        path: getAgentEnvFilePathElectron(),
+        message: 'Environment variables saved locally (this machine only).',
+      });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err), vars: {} });
+    }
+  });
+
   api.get('/api/status', async (req, res) => {
     const STATUS_TIMEOUT_MS = 15000;
     const localPromise = buildElectronStatusFallback(LOCAL_AI_URL, '');
@@ -2025,9 +2686,19 @@ async function startInternalApiServer() {
 
   api.post('/api/status/restart', async (req, res) => {
     const service = String(req.body?.service || '').trim();
+    const action = String(req.body?.action || 'restart')
+      .trim()
+      .toLowerCase();
+    const act = action === 'start' || action === 'stop' ? action : 'restart';
     try {
       let out;
       if (service === 'all') {
+        if (act !== 'restart') {
+          return res.status(400).json({
+            ok: false,
+            message: 'service=all only supports restart (use start/stop per service).',
+          });
+        }
         const msgs = [];
         let allOk = true;
         const rLlm = restartManagedAiServer();
@@ -2049,10 +2720,24 @@ async function startInternalApiServer() {
         msgs.push('knowledge_api: ' + rK.message);
         allOk = allOk && rK.ok;
         out = { ok: allOk, message: msgs.join('\n\n') };
-      } else if (service === 'comfyui') out = restartManagedComfy();
-      else if (service === 'local_llm') out = restartManagedAiServer();
-      else if (service === 'knowledge_api') out = await restartManagedKnowledgeApi();
-      else {
+      } else if (service === 'comfyui') {
+        out =
+          act === 'stop' ? stopManagedComfy() : act === 'start' ? startManagedComfy() : restartManagedComfy();
+      } else if (service === 'local_llm') {
+        out =
+          act === 'stop'
+            ? stopManagedAiServer()
+            : act === 'start'
+              ? startManagedAiServer()
+              : restartManagedAiServer();
+      } else if (service === 'knowledge_api') {
+        out =
+          act === 'stop'
+            ? await stopManagedKnowledgeApi()
+            : act === 'start'
+              ? await startManagedKnowledgeApi()
+              : await restartManagedKnowledgeApi();
+      } else {
         return res.status(400).json({ ok: false, message: 'Unknown or unsupported service: ' + service });
       }
       return res.json({ ok: !!out.ok, message: out.message });
@@ -2803,6 +3488,113 @@ async function startInternalApiServer() {
     }
   });
 
+  /** Edge neural TTS voice list cache (from knowledge/tts_edge.py --list-voices). */
+  let _ttsVoicesCache = { at: 0, voices: null };
+  const TTS_VOICES_CACHE_MS = 60 * 60 * 1000;
+  const TTS_MAX_CHARS = 4000;
+
+  api.get('/api/tts/voices', async (_req, res) => {
+    try {
+      const now = Date.now();
+      if (_ttsVoicesCache.voices && now - _ttsVoicesCache.at < TTS_VOICES_CACHE_MS) {
+        return res.json({ voices: _ttsVoicesCache.voices, default: 'en-US-AndrewNeural' });
+      }
+      const knowledgeDir = app.isPackaged
+        ? (process.resourcesPath ? path.join(process.resourcesPath, 'knowledge') : null)
+        : path.join(__dirname, '../../knowledge');
+      const ttsPy = knowledgeDir ? path.join(knowledgeDir, 'tts_edge.py') : null;
+      const python = resolvePythonForStt();
+      if (!ttsPy || !fs.existsSync(ttsPy)) {
+        return res.status(503).json({ error: 'TTS not available (missing knowledge/tts_edge.py).', voices: [] });
+      }
+      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
+        const proc = spawn(python, [ttsPy, '--list-voices'], {
+          cwd: knowledgeDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let out = '';
+        let err = '';
+        proc.stdout?.on('data', (d) => { out += d.toString(); });
+        proc.stderr?.on('data', (d) => { err += d.toString(); });
+        proc.on('close', (exitCode) => resolve({ stdout: out, stderr: err, code: exitCode }));
+        proc.on('error', reject);
+      });
+      if (code !== 0) {
+        return res.status(503).json({
+          error: (stderr || '').trim() || ('TTS list-voices failed (exit ' + code + ')'),
+          voices: [],
+        });
+      }
+      let voices = [];
+      try {
+        voices = JSON.parse((stdout || '').trim() || '[]');
+      } catch (_) {
+        return res.status(503).json({ error: 'Invalid voices JSON from tts_edge.py', voices: [] });
+      }
+      if (!Array.isArray(voices)) voices = [];
+      _ttsVoicesCache = { at: now, voices };
+      return res.json({ voices, default: 'en-US-AndrewNeural' });
+    } catch (err) {
+      return res.status(500).json({ error: String(err?.message || err), voices: [] });
+    }
+  });
+
+  /** Neural TTS (edge-tts). Needs internet. Returns audio/mpeg. */
+  api.post('/api/tts', async (req, res) => {
+    let tmpOut = null;
+    try {
+      const text = String((req.body && req.body.text) != null ? req.body.text : '').trim();
+      const voice = String((req.body && req.body.voice) || 'en-GB-RyanNeural').trim() || 'en-GB-RyanNeural';
+      if (!text) {
+        return res.status(400).json({ error: 'text is required' });
+      }
+      if (text.length > TTS_MAX_CHARS) {
+        return res.status(400).json({
+          error: 'text too long (max ' + TTS_MAX_CHARS + ' chars per request; chunk on the client)',
+        });
+      }
+      const knowledgeDir = app.isPackaged
+        ? (process.resourcesPath ? path.join(process.resourcesPath, 'knowledge') : null)
+        : path.join(__dirname, '../../knowledge');
+      const ttsPy = knowledgeDir ? path.join(knowledgeDir, 'tts_edge.py') : null;
+      const python = resolvePythonForStt();
+      if (!ttsPy || !fs.existsSync(ttsPy)) {
+        return res.status(503).json({ error: 'TTS not available (missing knowledge/tts_edge.py).' });
+      }
+      tmpOut = path.join(os.tmpdir(), 'butlor-tts-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.mp3');
+      const { stderr, code } = await new Promise((resolve, reject) => {
+        const proc = spawn(python, [ttsPy, '--voice', voice, '--out', tmpOut, '--text', text], {
+          cwd: knowledgeDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let err = '';
+        proc.stderr?.on('data', (d) => { err += d.toString(); });
+        proc.on('close', (exitCode) => resolve({ stderr: err, code: exitCode }));
+        proc.on('error', reject);
+      });
+      if (code !== 0 || !fs.existsSync(tmpOut)) {
+        const errTrim = (stderr || '').trim();
+        return res.status(503).json({
+          error: errTrim || ('TTS failed (exit ' + code + '). Install edge-tts in python-embed.'),
+        });
+      }
+      const buf = fs.readFileSync(tmpOut);
+      try { fs.unlinkSync(tmpOut); } catch (_) {}
+      tmpOut = null;
+      if (!buf || buf.length < 32) {
+        return res.status(503).json({ error: 'TTS produced empty audio' });
+      }
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.send(buf);
+    } catch (err) {
+      if (tmpOut) {
+        try { fs.unlinkSync(tmpOut); } catch (_) {}
+      }
+      return res.status(500).json({ error: String(err?.message || err) });
+    }
+  });
+
   api.post('/api/speech-to-text', async (req, res) => {
     try {
       const { audio, pcm, sampleRate } = req.body || {};
@@ -3396,6 +4188,13 @@ async function startInternalApiServer() {
 
       const moduleHint = typeof req.body?.module === 'string' ? String(req.body.module).trim().slice(0, 200) : '';
 
+      const voiceConversation = !!(
+        req.body?.voice_conversation ||
+        req.body?.voiceConversation ||
+        req.body?.voice_mode ||
+        req.body?.voiceMode
+      );
+
       // Cloud OpenAI first is opt-in (local model + /learn + web runs first by default). Set BUTLER_OPENAI_FIRST=1 to restore old behavior.
       const openaiFirst =
         process.env.BUTLER_OPENAI_FIRST === '1' ||
@@ -3444,6 +4243,7 @@ async function startInternalApiServer() {
           ...(hasInitImage ? { init_image: String(reqInitImage).trim() } : {}),
           ...(chatAttachment ? { attachment: chatAttachment } : {}),
           ...(moduleHint ? { module_hint: moduleHint } : {}),
+          ...(voiceConversation ? { voice_conversation: true } : {}),
         }),
         signal: AbortSignal.timeout(getButlerChatAbortMs()),
       });
@@ -3772,6 +4572,15 @@ async function startInternalApiServer() {
       }
 
       if (parsed.mode === 'sd_image2video') {
+        const videoOff = String(process.env.BUTLER_DISABLE_VIDEO || '1').trim().toLowerCase();
+        if (videoOff === '' || videoOff === '1' || videoOff === 'true' || videoOff === 'yes' || videoOff === 'on') {
+          sessions.set(sessionId, session);
+          return res.json({
+            reply:
+              'Local video generation is disabled to save VRAM. Image generation still works. Set BUTLER_DISABLE_VIDEO=0 to re-enable.',
+            source,
+          });
+        }
         let lastImg = (hasInitImage ? String(reqInitImage).trim() : '') || session.lastGeneratedImage;
         if (!lastImg) lastImg = readDesktopRbBase64Sync();
         if (!lastImg) {
@@ -3803,6 +4612,15 @@ async function startInternalApiServer() {
       }
 
       if (parsed.mode === 'sd_txt2video') {
+        const videoOff = String(process.env.BUTLER_DISABLE_VIDEO || '1').trim().toLowerCase();
+        if (videoOff === '' || videoOff === '1' || videoOff === 'true' || videoOff === 'yes' || videoOff === 'on') {
+          sessions.set(sessionId, session);
+          return res.json({
+            reply:
+              'Local text-to-video is disabled to save VRAM. Set BUTLER_DISABLE_VIDEO=0 to re-enable.',
+            source,
+          });
+        }
         const dispatched = await respondWithSdTxt2video({
           prompt: sdUserPromptOrModel(message, parsed.prompt),
           session,
@@ -3881,6 +4699,174 @@ async function startInternalApiServer() {
             ' Ensure the Knowledge API is running.';
           learnCtx(fail);
           return res.json({ reply: fail, source: 'MusicGen (local)' });
+        }
+      }
+
+      if (
+        parsed.mode === 'spotify_seo_create' ||
+        parsed.mode === 'spotify_seo_maintain' ||
+        parsed.mode === 'spotify_seo_cycle' ||
+        parsed.mode === 'spotify_seo_status'
+      ) {
+        const spotifyMode = parsed.mode;
+        const pathByMode = {
+          spotify_seo_status: '/spotify/status',
+          spotify_seo_create: '/spotify/seo/create',
+          spotify_seo_maintain: '/spotify/seo/maintain',
+          spotify_seo_cycle: '/spotify/seo/cycle',
+        };
+        const path = pathByMode[spotifyMode];
+        const isGet = spotifyMode === 'spotify_seo_status';
+        try {
+          const body = {
+            niche: parsed.niche || '',
+            niches: Array.isArray(parsed.niches) ? parsed.niches : undefined,
+            name: parsed.name || undefined,
+            keywords: parsed.keywords || undefined,
+            dry_run: !!parsed.dry_run,
+          };
+          const spRes = await fetch(LOCAL_AI_URL + path, {
+            method: isGet ? 'GET' : 'POST',
+            headers: isGet ? undefined : { 'Content-Type': 'application/json' },
+            body: isGet ? undefined : JSON.stringify(body),
+            signal: AbortSignal.timeout(120000),
+          });
+          const spData = await spRes.json().catch(() => ({}));
+          sessions.set(sessionId, session);
+          let reply =
+            (parsed.reply ? String(parsed.reply).trim() + '\n\n' : '') +
+            (spData.message || (spData.ok ? 'Done.' : 'Spotify SEO request failed.'));
+          if (spData.playlist && spData.playlist.url) {
+            reply += '\n' + spData.playlist.url;
+          }
+          if (Array.isArray(spData.playlists) && spData.playlists.length) {
+            const lines = spData.playlists
+              .slice(0, 12)
+              .map((p) => `- ${(p && p.name) || 'playlist'}: ${(p && p.url) || p.id || ''}`)
+              .join('\n');
+            reply += '\n\n' + lines;
+          }
+          if (!spData.ok && spData.connected === false) {
+            reply +=
+              '\n\nConnect Spotify: set SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET in .env, then run `npm run spotify:oauth` (or `python knowledge/spotify_oauth_setup.py`).';
+          }
+          learnCtx(reply);
+          try {
+            learnIntent(message, spotifyMode, {
+              niche: String(parsed.niche || '').slice(0, 120),
+            });
+          } catch (_) {}
+          return res.json({
+            reply,
+            source: 'Spotify SEO',
+            spotify: spData,
+          });
+        } catch (err) {
+          sessions.set(sessionId, session);
+          const fail =
+            'Spotify SEO request failed: ' +
+            String((err && err.message) || err).slice(0, 400) +
+            ' Ensure the Knowledge API is running.';
+          learnCtx(fail);
+          return res.json({ reply: fail, source: 'Spotify SEO' });
+        }
+      }
+
+      if (
+        parsed.mode === 'artist_project_show' ||
+        parsed.mode === 'artist_project_update' ||
+        parsed.mode === 'artist_project_sync'
+      ) {
+        const artMode = parsed.mode;
+        try {
+          let artRes;
+          if (artMode === 'artist_project_show') {
+            artRes = await fetch(LOCAL_AI_URL + '/artist/project', {
+              method: 'GET',
+              signal: AbortSignal.timeout(30000),
+            });
+          } else if (artMode === 'artist_project_sync') {
+            artRes = await fetch(LOCAL_AI_URL + '/artist/project/sync', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                source: parsed.source || 'all',
+                artist_id: parsed.artist_id || parsed.artistId || undefined,
+                force: !!parsed.force,
+              }),
+              signal: AbortSignal.timeout(120000),
+            });
+          } else {
+            const updates = {};
+            const keys = [
+              'artist_name',
+              'aliases',
+              'bio',
+              'tagline',
+              'location',
+              'genres',
+              'subgenres',
+              'moods',
+              'themes',
+              'keywords',
+              'seo_niches',
+              'similar_artists',
+              'collaborators',
+              'spotify_artist_ids',
+              'track_uris',
+              'track_titles',
+              'target_audience',
+              'brand_voice',
+              'do_not_associate',
+              'notes',
+              'bpm_ranges',
+              'cities',
+            ];
+            for (const k of keys) {
+              if (parsed[k] != null && parsed[k] !== '') updates[k] = parsed[k];
+            }
+            artRes = await fetch(LOCAL_AI_URL + '/artist/project', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(updates),
+              signal: AbortSignal.timeout(30000),
+            });
+          }
+          const artData = await artRes.json().catch(() => ({}));
+          sessions.set(sessionId, session);
+          const proj = artData.project || {};
+          let reply =
+            (parsed.reply ? String(parsed.reply).trim() + '\n\n' : '') +
+            (artData.message || (artData.ok ? 'Artist project updated.' : 'Artist project request failed.'));
+          if (proj.artist_name) reply += `\n\nArtist: ${proj.artist_name}`;
+          if (Array.isArray(proj.genres) && proj.genres.length) {
+            reply += `\nGenres: ${proj.genres.slice(0, 10).join(', ')}`;
+          }
+          if (Array.isArray(proj.seo_niches) && proj.seo_niches.length) {
+            reply += `\nSEO niches: ${proj.seo_niches.slice(0, 10).join(', ')}`;
+          }
+          if (Array.isArray(proj.keywords) && proj.keywords.length) {
+            reply += `\nKeywords: ${proj.keywords.slice(0, 12).join(', ')}`;
+          }
+          if (Array.isArray(proj.similar_artists) && proj.similar_artists.length) {
+            reply += `\nSimilar: ${proj.similar_artists.slice(0, 8).join(', ')}`;
+          }
+          if (Array.isArray(proj.track_titles) && proj.track_titles.length) {
+            reply += `\nTracks: ${proj.track_titles.slice(0, 10).join(', ')}`;
+          }
+          learnCtx(reply);
+          try {
+            learnIntent(message, artMode, { artist: String(proj.artist_name || '').slice(0, 80) });
+          } catch (_) {}
+          return res.json({ reply, source: 'Artist project', artist_project: artData });
+        } catch (err) {
+          sessions.set(sessionId, session);
+          const fail =
+            'Artist project request failed: ' +
+            String((err && err.message) || err).slice(0, 400) +
+            ' Ensure the Knowledge API is running.';
+          learnCtx(fail);
+          return res.json({ reply: fail, source: 'Artist project' });
         }
       }
 
@@ -4584,6 +5570,8 @@ async function startInternalApiServer() {
         agent_provider: parsed.agent_provider || provider,
         fallback_chain: Array.isArray(parsed.fallback_chain) ? parsed.fallback_chain : undefined,
         needs_continue: Boolean(parsed.needs_continue),
+        needs_review: Boolean(parsed.needs_review),
+        self_edit_review: parsed.self_edit_review || null,
       });
     } catch (err) {
       const errName = err?.name || (err && err.constructor && err.constructor.name) || 'Error';
@@ -4642,6 +5630,32 @@ async function startInternalApiServer() {
     }
   });
 
+  api.get('/api/agent/cascade-status', async (req, res) => {
+    try {
+      const provider = String(req.query.provider || req.query.selected || 'auto_free').trim() || 'auto_free';
+      const probe = String(req.query.probe || '').trim().toLowerCase();
+      const qs = `provider=${encodeURIComponent(provider)}${probe === '1' || probe === 'true' ? '&probe=1' : ''}`;
+      const proxied = await proxyKnowledgeAgentJsonElectron('GET', `/agent/cascade-status?${qs}`);
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.post('/api/agent/cascade-status', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const proxied = await proxyKnowledgeAgentJsonElectron('POST', '/agent/cascade-status', {
+        provider: body.provider || body.selected || 'auto_free',
+        api_keys: body.api_keys || body.apiKeys || {},
+        probe: true,
+      });
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
   api.get('/api/agent/checkpoints', async (req, res) => {
     try {
       const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
@@ -4686,6 +5700,85 @@ async function startInternalApiServer() {
     }
   });
 
+  api.get('/api/agent/self-edit-reviews', async (_req, res) => {
+    try {
+      const proxied = await proxyKnowledgeAgentJsonElectron('GET', '/agent/self-edit-reviews');
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err), reviews: [] });
+    }
+  });
+
+  api.get('/api/agent/self-edit-review', async (req, res) => {
+    try {
+      const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
+      const reviewId = String(req.query.reviewId || req.query.review_id || '').trim();
+      let knowledgePath = `/agent/self-edit-review?session_id=${encodeURIComponent(sessionId)}`;
+      if (reviewId) knowledgePath += `&review_id=${encodeURIComponent(reviewId)}`;
+      const proxied = await proxyKnowledgeAgentJsonElectron('GET', knowledgePath);
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.get('/api/agent/self-edit-review/changes', async (req, res) => {
+    try {
+      const sessionId = String(req.query.sessionId || req.query.session_id || 'butler-agent').trim();
+      const proxied = await proxyKnowledgeAgentJsonElectron(
+        'GET',
+        `/agent/self-edit-review/changes?session_id=${encodeURIComponent(sessionId)}`,
+      );
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err), changes: [] });
+    }
+  });
+
+  api.post('/api/agent/self-edit-review/accept', async (req, res) => {
+    try {
+      const { sessionId, force } = req.body || {};
+      const proxied = await proxyKnowledgeAgentJsonElectron('POST', '/agent/self-edit-review/accept', {
+        session_id: String(sessionId || 'butler-agent'),
+        force: Boolean(force),
+      });
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.post('/api/agent/self-edit-review/reject', async (req, res) => {
+    try {
+      const { sessionId } = req.body || {};
+      const proxied = await proxyKnowledgeAgentJsonElectron('POST', '/agent/self-edit-review/reject', {
+        session_id: String(sessionId || 'butler-agent'),
+      });
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.get('/api/agent/self-edit/codebase-index', async (_req, res) => {
+    try {
+      const proxied = await proxyKnowledgeAgentJsonElectron('GET', '/agent/self-edit/codebase-index');
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.post('/api/agent/self-edit/codebase-index', async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const proxied = await proxyKnowledgeAgentJsonElectron('POST', '/agent/self-edit/codebase-index', body);
+      return res.status(proxied.status).json(proxied.data);
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
   api.post('/api/agent/open-path', async (req, res) => {
     try {
       const target = String(req.body?.path || '').trim();
@@ -4696,6 +5789,142 @@ async function startInternalApiServer() {
       return res.json({ ok: true, path: target });
     } catch (err) {
       return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  const {
+    runInShellSession,
+    resetShellSession,
+    getShellInfo,
+    listShells,
+  } = require('./agent-powershell-session.cjs');
+
+  function electronAgentShellEnv() {
+    const base = String(LOCAL_AI_URL || '').trim() || 'http://127.0.0.1:8775';
+    return { ...process.env, KNOWLEDGE_API_URL: base, LOCAL_AI_URL: base };
+  }
+
+  function electronSafeTerminalCwd(rawCwd, projectRoot) {
+    const pr = path.resolve(projectRoot);
+    const raw = rawCwd != null && String(rawCwd).trim() !== '' ? String(rawCwd).trim() : '.';
+    const cwd = path.resolve(path.isAbsolute(raw) ? raw : path.join(pr, raw));
+    const norm = path.normalize(cwd);
+    const noTrail = norm.replace(/[/\\]+$/, '') || norm;
+    if (process.platform === 'win32' && /^[a-zA-Z]:$/i.test(noTrail)) return pr;
+    if (noTrail === '/' || noTrail === '') return pr;
+    return norm;
+  }
+
+  api.get('/api/agent/terminal/shells', (_req, res) => {
+    try {
+      return res.json({ ok: true, shells: listShells() });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.get('/api/agent/terminal', (req, res) => {
+    try {
+      const sessionId = String(req.query.sessionId || 'butler-agent-window').trim();
+      const shell = String(req.query.shell || '').trim();
+      return res.json(getShellInfo(sessionId, shell));
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.post('/api/agent/terminal/reset', async (req, res) => {
+    try {
+      const sessionId = String(req.body?.sessionId || 'butler-agent-window').trim();
+      const rawCwd = String(req.body?.cwd || '').trim();
+      const shell = String(req.body?.shell || '').trim();
+      const projectRoot = await resolveAgentProjectRoot(sessionId, rawCwd);
+      const cwd = electronSafeTerminalCwd(rawCwd || projectRoot, projectRoot);
+      const info = resetShellSession({
+        sessionId,
+        cwd,
+        shell,
+        env: electronAgentShellEnv(),
+      });
+      return res.json({ ...info, cwd });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  api.post('/api/agent/terminal', async (req, res) => {
+    const started = Date.now();
+    try {
+      const sessionId = String(req.body?.sessionId || 'butler-agent-window').trim();
+      const rawCwd = String(req.body?.cwd || '').trim();
+      const command = String(req.body?.command || '').trim();
+      const shell = String(req.body?.shell || '').trim();
+      const stream = Boolean(req.body?.stream);
+      if (!command) {
+        return res.status(400).json({
+          ok: false,
+          command: '',
+          cwd: rawCwd || '',
+          stdout: '',
+          stderr: '',
+          code: null,
+          message: 'command required',
+          duration_ms: Date.now() - started,
+        });
+      }
+      const projectRoot = await resolveAgentProjectRoot(sessionId, rawCwd);
+      const cwd = electronSafeTerminalCwd(rawCwd || projectRoot, projectRoot);
+      if (req.body?.reset) {
+        resetShellSession({ sessionId, cwd, shell, env: electronAgentShellEnv() });
+      }
+
+      if (stream) {
+        res.status(200);
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        const writeLine = (obj) => {
+          try {
+            res.write(`${JSON.stringify(obj)}\n`);
+          } catch {
+            /* client gone */
+          }
+        };
+        writeLine({ type: 'start', command, cwd, shell: shell || undefined });
+        const result = await runInShellSession({
+          sessionId,
+          cwd,
+          command,
+          shell,
+          env: electronAgentShellEnv(),
+          timeoutMs: 120000,
+          onChunk: (text) => writeLine({ type: 'chunk', text }),
+        });
+        writeLine({ type: 'done', ...result });
+        return res.end();
+      }
+
+      const result = await runInShellSession({
+        sessionId,
+        cwd,
+        command,
+        shell,
+        env: electronAgentShellEnv(),
+        timeoutMs: 120000,
+      });
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        command: String(req.body?.command || ''),
+        cwd: String(req.body?.cwd || ''),
+        stdout: '',
+        stderr: '',
+        code: null,
+        message: String(err?.message || err),
+        duration_ms: Date.now() - started,
+      });
     }
   });
 
@@ -4729,35 +5958,236 @@ async function startInternalApiServer() {
     }
   });
 
-  api.post('/api/butler/rebuild', (_req, res) => {
+  api.post('/api/butler/rebuild', (req, res) => {
     try {
-      const uiDir = app.isPackaged
-        ? path.join(path.dirname(process.execPath), '..', '..')
-        : path.join(__dirname, '..');
-      if (!fs.existsSync(path.join(uiDir, 'package.json'))) {
+      const fast =
+        req.body?.fast === true ||
+        req.body?.mode === 'fast' ||
+        String(req.query?.mode || '').toLowerCase() === 'fast';
+      const findRepoRoot = () => {
+        const envRepo = String(process.env.BUTLER_REPO_DIR || '').trim();
+        if (envRepo && fs.existsSync(path.join(envRepo, 'package.json'))) return envRepo;
+        const candidates = [];
+        if (app.isPackaged) {
+          const exeDir = path.dirname(process.execPath);
+          // dist-desktop/App/Butler.exe → repo may be BUTLER_REPO_DIR or sibling checkout
+          candidates.push(path.resolve(exeDir, '..', '..', '..'));
+          candidates.push(path.resolve(exeDir, '..', '..'));
+          candidates.push(path.resolve(exeDir, '..', '..', '..', '..'));
+        } else {
+          // ui/electron → repo root
+          candidates.push(path.resolve(__dirname, '..', '..'));
+        }
+        for (const c of candidates) {
+          if (fs.existsSync(path.join(c, 'package.json')) && fs.existsSync(path.join(c, 'ui', 'package.json'))) {
+            return c;
+          }
+        }
+        // Fallback: ui folder parent (dev) or packaged ui guess
+        const uiDir = app.isPackaged
+          ? path.join(path.dirname(process.execPath), '..', '..')
+          : path.join(__dirname, '..');
+        if (fs.existsSync(path.join(uiDir, 'package.json'))) {
+          const parent = path.resolve(uiDir, '..');
+          if (fs.existsSync(path.join(parent, 'package.json'))) return parent;
+          return uiDir;
+        }
+        return null;
+      };
+      const repoRoot = findRepoRoot();
+      if (!repoRoot) {
         return res.json({
           ok: false,
           message:
-            'Could not find ui/package.json beside this install. Use a full dev checkout, or open a terminal in your Butler repo ui folder and run: npm run build:app',
+            'Could not find Butler repo (package.json). Set BUTLER_REPO_DIR to your clone, or run from a full checkout.',
         });
       }
       if (process.platform !== 'win32') {
         return res.json({
           ok: false,
-          message:
-            'Rebuild from Settings is Windows-only. In a terminal: cd to your Butler repo ui folder, then npm run build:app. Quit Butler and launch the new build when finished.',
+          message: fast
+            ? 'Fast rebuild is Windows-only. In a terminal: npm run desktop:patch'
+            : 'Rebuild from Settings is Windows-only. In a terminal: cd ui && npm run build:app',
         });
       }
-      const safeUi = uiDir.replace(/"/g, '""');
-      spawn('cmd.exe', ['/c', 'start', 'Rebuild Butler', 'cmd', '/k', `cd /d "${safeUi}" && npm run build:app`], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: false,
-      }).unref();
+      const safeRoot = repoRoot.replace(/"/g, '""');
+      const npmCmd = fast ? 'npm run desktop:patch' : 'npm run rebuild-butler';
+      const title = fast ? 'Butler Fast Rebuild' : 'Rebuild Butler';
+      spawn(
+        'cmd.exe',
+        ['/c', 'start', title, 'cmd', '/k', `cd /d "${safeRoot}" && ${npmCmd}`],
+        {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false,
+        },
+      ).unref();
       return res.json({
         ok: true,
-        message:
-          'Opened a console window running npm run build:app in the ui folder. When the build finishes, quit Butler and launch the new app from ui\\dist-app-new\\win-unpacked (or your desktop shortcut).',
+        fast: !!fast,
+        message: fast
+          ? 'Opened a console running npm run desktop:patch (vite build + asar patch). Quit Butler.exe before the patch replaces app.asar, then relaunch dist-desktop\\App\\Butler.exe.'
+          : 'Opened a console window running full rebuild (npm run rebuild-butler). When finished, quit Butler and launch the new app.',
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, message: String((e && e.message) || e) });
+    }
+  });
+
+  api.post('/api/butler/snapshot-stable', (req, res) => {
+    try {
+      const findRepoRoot = () => {
+        const envRepo = String(process.env.BUTLER_REPO_DIR || '').trim();
+        if (envRepo && fs.existsSync(path.join(envRepo, 'package.json'))) return envRepo;
+        const candidates = [];
+        if (app.isPackaged) {
+          const exeDir = path.dirname(process.execPath);
+          candidates.push(path.resolve(exeDir, '..', '..', '..'));
+          candidates.push(path.resolve(exeDir, '..', '..'));
+          candidates.push(path.resolve(exeDir, '..', '..', '..', '..'));
+        } else {
+          candidates.push(path.resolve(__dirname, '..', '..'));
+        }
+        for (const c of candidates) {
+          if (fs.existsSync(path.join(c, 'package.json')) && fs.existsSync(path.join(c, 'ui', 'package.json'))) {
+            return c;
+          }
+        }
+        const uiDir = app.isPackaged
+          ? path.join(path.dirname(process.execPath), '..', '..')
+          : path.join(__dirname, '..');
+        if (fs.existsSync(path.join(uiDir, 'package.json'))) {
+          const parent = path.resolve(uiDir, '..');
+          if (fs.existsSync(path.join(parent, 'package.json'))) return parent;
+          return uiDir;
+        }
+        return null;
+      };
+      const repoRoot = findRepoRoot();
+      if (!repoRoot) {
+        return res.json({
+          ok: false,
+          message:
+            'Could not find Butler repo (package.json). Set BUTLER_REPO_DIR to your clone, or run from a full checkout.',
+        });
+      }
+      const scriptPath = path.join(repoRoot, 'scripts', 'snapshot-dist-desktop.mjs');
+      if (!fs.existsSync(scriptPath)) {
+        return res.json({
+          ok: false,
+          message: `Missing snapshot script: ${scriptPath}`,
+        });
+      }
+      const distDesktop = path.join(repoRoot, 'dist-desktop');
+      if (!fs.existsSync(path.join(distDesktop, 'App', 'Butler.exe'))) {
+        return res.json({
+          ok: false,
+          message:
+            'No packaged build at dist-desktop\\App\\Butler.exe. Rebuild desktop first, then Push to stable.',
+        });
+      }
+      const child = spawn('node', [scriptPath, '--force'], {
+        cwd: repoRoot,
+        windowsHide: true,
+        shell: true,
+        env: { ...process.env },
+      });
+      let stdout = '';
+      let stderr = '';
+      let responded = false;
+      const maxCap = 200_000;
+      const reply = (status, body) => {
+        if (responded) return;
+        responded = true;
+        if (status >= 400) return res.status(status).json(body);
+        return res.json(body);
+      };
+      child.stdout?.on('data', (chunk) => {
+        stdout += String(chunk);
+        if (stdout.length > maxCap) stdout = stdout.slice(-maxCap);
+      });
+      child.stderr?.on('data', (chunk) => {
+        stderr += String(chunk);
+        if (stderr.length > maxCap) stderr = stderr.slice(-maxCap);
+      });
+      const timeoutMs = 10 * 60 * 1000;
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch (_) {}
+      }, timeoutMs);
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        return reply(500, {
+          ok: false,
+          message: String(err?.message || err),
+        });
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        const out = [stdout, stderr].filter(Boolean).join('\n').trim();
+        const tail = out
+          ? out
+              .split(/\r?\n/)
+              .filter(Boolean)
+              .slice(-12)
+              .join('\n')
+          : '';
+        if (code === 0) {
+          return reply(200, {
+            ok: true,
+            message:
+              'Pushed current dist-desktop to dist-desktop-stable (dated backup + Butler (Stable).lnk updated).',
+            output: tail,
+            code,
+          });
+        }
+        return reply(200, {
+          ok: false,
+          message: tail
+            ? `Snapshot failed (exit ${code}).\n${tail}`
+            : `Snapshot failed (exit ${code == null ? 'timeout/killed' : code}).`,
+          output: tail,
+          code: code == null ? -1 : code,
+        });
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, message: String((e && e.message) || e) });
+    }
+  });
+
+  api.get('/api/butler/lite-status', async (_req, res) => {
+    try {
+      const status = await getButlerLiteStatusPayload();
+      return res.json(status);
+    } catch (e) {
+      return res.status(500).json({ ok: false, message: String((e && e.message) || e) });
+    }
+  });
+
+  api.post('/api/butler/lite-launch', async (req, res) => {
+    try {
+      const openBrowser = req.body?.openBrowser !== false && req.body?.open_browser !== false;
+      const result = await ensureButlerLiteTunnel();
+      const status = await getButlerLiteStatusPayload();
+      if (result.ok && openBrowser) {
+        try {
+          await shell.openExternal(BUTLER_LITE_PAGE_URL);
+        } catch (err) {
+          console.warn(
+            '[Butler Lite] openExternal failed:',
+            err && err.message ? err.message : err,
+          );
+        }
+      }
+      return res.json({
+        ...status,
+        ok: !!result.ok,
+        reused: !!result.reused,
+        message: result.message || (result.ok ? 'Butler Lite ready.' : 'Butler Lite launch failed.'),
+        tunnel_url: result.tunnel_url || status.tunnel_url || null,
+        page_url: BUTLER_LITE_PAGE_URL,
+        opened_browser: !!(result.ok && openBrowser),
       });
     } catch (e) {
       return res.status(500).json({ ok: false, message: String((e && e.message) || e) });
@@ -4767,6 +6197,67 @@ async function startInternalApiServer() {
   // -----------------------------
   // Image SD routes (mirror ui-server.js → Knowledge /sd/* + local preset store)
   // -----------------------------
+  const workflowPresetHelpers = (() => {
+    const candidates = [
+      // Packaged: lives beside main.cjs inside app.asar/electron/
+      path.join(__dirname, 'easy-img2img-workflow-presets.cjs'),
+      // Packaged alternate: asar root (patch / electron-builder root file)
+      path.join(__dirname, '..', 'easy-img2img-workflow-presets.cjs'),
+      // Dev: repo root from ui/electron
+      path.join(__dirname, '..', '..', 'easy-img2img-workflow-presets.cjs'),
+    ];
+    for (const candidate of candidates) {
+      try {
+        // Prefer require first — asar paths can fail existsSync on some Electron builds.
+        return require(candidate);
+      } catch (_) {
+        /* try next */
+      }
+    }
+    // Never crash Butler startup if the helper is missing from a partial patch.
+    console.warn('[Butler] easy-img2img-workflow-presets.cjs missing; workflow preset APIs use inline fallbacks.');
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const knobsFromBalance = (balance) => {
+      const b = Math.max(-1, Math.min(1, Number(balance) || 0));
+      const promptT = Math.max(0.08, Math.min(0.92, (b + 1) / 2));
+      return {
+        balance: b,
+        cfg: Math.round(lerp(5.0, 6.8, promptT) * 100) / 100,
+        steps: Math.round(lerp(38, 52, promptT)),
+        faceid_weight: Math.round(lerp(0.9, 0.48, promptT) * 1000) / 1000,
+        faceid_v2: Math.round(lerp(1.55, 0.95, promptT) * 1000) / 1000,
+        faceid_end: Math.round(lerp(0.9, 0.42, promptT) * 1000) / 1000,
+        faceid_lora: Math.round(lerp(0.72, 0.42, promptT) * 1000) / 1000,
+      };
+    };
+    return {
+      BUILTIN_WORKFLOW_KNOBS: {},
+      knobsFromBalance,
+      cleanWorkflowKnobs: (raw) => (raw && typeof raw === 'object' ? knobsFromBalance(raw.balance) : null),
+      knobsForNamedOrBalance: (_name, balance) => knobsFromBalance(balance),
+      sanitizeWorkflowPresetName: (raw) =>
+        String(raw || 'saved_custom')
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .slice(0, 48) || 'saved_custom',
+      isPlausibleWorkflowPresetName: (name) => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/.test(String(name || '')),
+      workflowPresetNameForResult: (_rel, fields, fileMeta) =>
+        `saved_${fileMeta?.preset || fields?.preset || 'custom'}_s${fileMeta?.sweep_seed ?? fields?.sweep_seed ?? 0}`.slice(
+          0,
+          48,
+        ),
+    };
+  })();
+  const {
+    BUILTIN_WORKFLOW_KNOBS,
+    knobsFromBalance,
+    cleanWorkflowKnobs,
+    knobsForNamedOrBalance,
+    sanitizeWorkflowPresetName,
+    isPlausibleWorkflowPresetName,
+    workflowPresetNameForResult,
+  } = workflowPresetHelpers;
   const EASY_SWEEP_PRESETS = new Set([
     '01_face_lock',
     '02_soft_face',
@@ -4799,6 +6290,7 @@ async function startInternalApiServer() {
     'scene',
     'mode',
     'sweep_seed',
+    'sweep_count',
     'balance',
     'framing',
     'emphasize_action',
@@ -4807,6 +6299,25 @@ async function startInternalApiServer() {
     'photoreal',
     'preset',
   ];
+
+  const EASY_PROMPT_FIELD_DEFAULTS = {
+    details: '',
+    avoid: '',
+    action: '',
+    pose: '',
+    outfit: '',
+    scene: '',
+    mode: 'single',
+    sweep_seed: 0,
+    sweep_count: 20,
+    balance: 0.35,
+    framing: 'full_body',
+    emphasize_action: true,
+    hands_in_frame: true,
+    frontal_face: true,
+    photoreal: true,
+    preset: '20_high_lora_face',
+  };
 
   /** Electron historically used D:\butlor; ui-server uses D:\butler (repo). Prefer the file that exists. */
   function easyPromptPresetsPath() {
@@ -4837,16 +6348,155 @@ async function startInternalApiServer() {
 
   function cleanEasyPromptFields(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-    const out = {};
+    const out = { ...EASY_PROMPT_FIELD_DEFAULTS };
+    let any = false;
     for (const key of EASY_PROMPT_FIELD_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(raw, key)) out[key] = raw[key];
+      if (Object.prototype.hasOwnProperty.call(raw, key)) {
+        out[key] = raw[key];
+        any = true;
+      }
     }
-    return Object.keys(out).length === EASY_PROMPT_FIELD_KEYS.length ? out : null;
+    return any ? out : null;
+  }
+
+  async function upsertEasyPromptPreset(name, fields, requestedId = '') {
+    const cleanName = String(name || '').trim().slice(0, 80);
+    const cleanFields = cleanEasyPromptFields(fields);
+    if (!cleanName || !cleanFields) return null;
+    const store = readEasyPromptPresetStore();
+    const now = new Date().toISOString();
+    const payloadBase64 = Buffer.from(JSON.stringify(cleanFields), 'utf8').toString('base64');
+    const idHint = String(requestedId || '').trim();
+    const existing = store.presets.find(
+      (preset) =>
+        (idHint && String(preset?.id || '') === idHint) ||
+        String(preset?.name || '').toLocaleLowerCase() === cleanName.toLocaleLowerCase(),
+    );
+    if (existing) {
+      existing.name = cleanName;
+      existing.updated_at = now;
+      existing.payload_base64 = payloadBase64;
+    } else {
+      store.presets.push({
+        id: randomUUID(),
+        name: cleanName,
+        updated_at: now,
+        payload_base64: payloadBase64,
+      });
+    }
+    store.presets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    const file = easyPromptPresetsPath();
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
+    return existing || store.presets.find((preset) => preset.name === cleanName) || null;
+  }
+
+  function metaFromEasySweepFilename(filename) {
+    const base = String(filename || '')
+      .replace(/\\/g, '/')
+      .split('/')
+      .pop() || '';
+    const match = base.match(
+      /^(.+?)_(single|sweep_winners|sweep_20)(?:_r.+?)?_s(\d+)_\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
+    );
+    if (!match) return null;
+    const preset = match[1];
+    if (!isPlausibleWorkflowPresetName(preset) && preset !== 'custom') return null;
+    return {
+      preset,
+      mode: String(match[2] || 'single').toLowerCase(),
+      sweep_seed: Math.max(0, Math.trunc(Number(match[3]) || 0)),
+    };
+  }
+
+  function readEasyRunMeta(sweepDir, runKey) {
+    const key = String(runKey || '')
+      .replace(/\\/g, '/')
+      .replace(/^easy_sweep\//, '')
+      .split('/')
+      .filter(Boolean)[0];
+    if (!key || key.includes('..')) return null;
+    try {
+      const full = path.join(sweepDir, key, 'easy_prompt.json');
+      const parsed = JSON.parse(fs.readFileSync(full, 'utf8'));
+      const fields = parsed?.easy_prompt;
+      return fields && typeof fields === 'object' && !Array.isArray(fields) ? fields : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function buildWorkflowKnobsForSavedResult(relPath, sweepDir, fallbackFields) {
+    const fileMeta = metaFromEasySweepFilename(relPath);
+    if (!fileMeta) return null;
+    const runKey = easySweepRunGroupKey(relPath);
+    const runFields = readEasyRunMeta(sweepDir, runKey) || fallbackFields || {};
+    const presetName = fileMeta.preset || runFields.preset || 'custom';
+    if (BUILTIN_WORKFLOW_KNOBS[presetName]) return { ...BUILTIN_WORKFLOW_KNOBS[presetName] };
+    const userHit = readEasyWorkflowPresetStore().presets.find((p) => p.name === presetName);
+    if (userHit?.knobs) return cleanWorkflowKnobs(userHit.knobs) || knobsFromBalance(runFields.balance);
+    return knobsForNamedOrBalance(presetName, runFields.balance ?? 0.35);
+  }
+
+  function easyWorkflowPresetsPath() {
+    return path.join(easySweepPaths().outputRoot, 'butler_easy_workflow_presets.json');
+  }
+
+  function readEasyWorkflowPresetStore() {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(easyWorkflowPresetsPath(), 'utf8'));
+      return {
+        version: 1,
+        presets: Array.isArray(parsed?.presets) ? parsed.presets : [],
+      };
+    } catch {
+      return { version: 1, presets: [] };
+    }
+  }
+
+  async function upsertEasyWorkflowPreset(name, knobs, requestedId = '') {
+    const cleanName = sanitizeWorkflowPresetName(name);
+    const cleanKnobs = cleanWorkflowKnobs(knobs) || knobsForNamedOrBalance(cleanName, knobs?.balance);
+    if (!cleanName || !cleanKnobs) return null;
+    const store = readEasyWorkflowPresetStore();
+    const now = new Date().toISOString();
+    const idHint = String(requestedId || '').trim();
+    const existing = store.presets.find(
+      (preset) =>
+        (idHint && String(preset?.id || '') === idHint) ||
+        String(preset?.name || '').toLocaleLowerCase() === cleanName.toLocaleLowerCase(),
+    );
+    if (existing) {
+      existing.name = cleanName;
+      existing.updated_at = now;
+      existing.knobs = cleanKnobs;
+    } else {
+      store.presets.push({
+        id: randomUUID(),
+        name: cleanName,
+        updated_at: now,
+        knobs: cleanKnobs,
+      });
+    }
+    store.presets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    const file = easyWorkflowPresetsPath();
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
+    return existing || store.presets.find((preset) => preset.name === cleanName) || null;
   }
 
   function easySweepPaths() {
-    const comfyRoot = path.join(getSdProjectPath(), 'ComfyUI');
-    const outputRoot = path.join(comfyRoot, 'output');
+    // Packaged desktop Comfy uses --output-directory under %TEMP%\butler-comfyui-desktop
+    // (BUTLER_COMFY_OUTPUT_DIR). Dev may still use sd/ComfyUI/output.
+    const envOut = String(
+      process.env.BUTLER_COMFY_OUTPUT_DIR || process.env.COMFYUI_OUTPUT_DIR || '',
+    ).trim();
+    const tempRoot = String(process.env.BUTLER_COMFY_TEMP_ROOT || '').trim();
+    const outputRoot = envOut
+      ? path.resolve(envOut)
+      : tempRoot
+        ? path.join(path.resolve(tempRoot), 'output')
+        : path.join(getSdProjectPath(), 'ComfyUI', 'output');
     return {
       outputRoot,
       sweepDir: path.join(outputRoot, 'easy_sweep'),
@@ -4854,28 +6504,69 @@ async function startInternalApiServer() {
     };
   }
 
+  const SWEEP_IMAGE_EXT_RE = /\.(?:png|jpe?g|webp|enc)$/i;
+  const SWEEP_ENC_KEY = 'butler-sweep-secure-key-2024';
+
+  /** Decode ButlerSweepSave .enc (XOR) for Butler UI; pass through real images. */
+  function decodeSweepImageBytes(rawData, relPath) {
+    const buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData || []);
+    if (!buf.length) return buf;
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+      return buf;
+    }
+    if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) return buf;
+    if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
+      return buf;
+    }
+    const low = String(relPath || '').toLowerCase();
+    const looksPlainExt =
+      /\.(?:png|jpe?g|webp|gif)$/i.test(low) && !low.endsWith('.enc');
+    if (looksPlainExt) return buf;
+    const decoded = Buffer.alloc(buf.length);
+    for (let i = 0; i < buf.length; i++) {
+      decoded[i] = buf[i] ^ SWEEP_ENC_KEY.charCodeAt(i % SWEEP_ENC_KEY.length);
+    }
+    if (
+      (decoded.length >= 8 &&
+        decoded[0] === 0x89 &&
+        decoded[1] === 0x50 &&
+        decoded[2] === 0x4e &&
+        decoded[3] === 0x47) ||
+      (decoded.length >= 2 && decoded[0] === 0xff && decoded[1] === 0xd8)
+    ) {
+      return decoded;
+    }
+    return low.endsWith('.enc') ? decoded : buf;
+  }
+
   function presetFromEasySweepFilename(filename) {
     const base = String(filename || '').replace(/\\/g, '/').split('/').pop() || '';
     const match = base.match(
-      /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+      /^(.+?)_(?:single|sweep_winners|sweep_20)(?:_r.+?)?_s\d+_\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
     );
     const preset = match?.[1] || '';
-    return EASY_SWEEP_PRESETS.has(preset) ? preset : '';
+    if (!preset) return '';
+    if (EASY_SWEEP_PRESETS.has(preset) || preset === 'custom') return preset;
+    return isPlausibleWorkflowPresetName(preset) ? preset : '';
   }
 
   function easySweepRunGroupKey(relPath) {
     const normalized = String(relPath || '').replace(/\\/g, '/');
     const parts = normalized.split('/').filter(Boolean);
+    // Paths are relative to easy_sweep/: <run_folder>/<file>  OR legacy easy_sweep/<run>/…
     if (parts.length >= 2 && parts[0] === 'easy_sweep') {
       return parts[1];
     }
+    if (parts.length >= 2) {
+      return parts[0];
+    }
     const base = parts[parts.length - 1] || '';
     const withRun = base.match(
-      /^(.+?_(?:single|sweep_winners|sweep_20)_r.+?)(?:_s\d+)(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+      /^(.+?_(?:single|sweep_winners|sweep_20)_r.+?)(?:_s\d+)(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
     );
     if (withRun?.[1]) return withRun[1];
     const modeMatch = base.match(
-      /^(.+?)_(sweep_20|sweep_winners|single)_s\d+(?:_\d+)?\.(?:png|jpe?g|webp)$/i,
+      /^(.+?)_(sweep_20|sweep_winners|single)_s\d+(?:_\d+)?\.(?:png|jpe?g|webp|enc)$/i,
     );
     if (modeMatch?.[2]) {
       return 'legacy_' + modeMatch[2];
@@ -4904,7 +6595,7 @@ async function startInternalApiServer() {
         const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           await walk(full, rel);
-        } else if (entry.isFile() && /\.(?:png|jpe?g|webp)$/i.test(entry.name)) {
+        } else if (entry.isFile() && SWEEP_IMAGE_EXT_RE.test(entry.name)) {
           results.push({ full, rel });
         }
       }
@@ -4944,38 +6635,23 @@ async function startInternalApiServer() {
       const fields = cleanEasyPromptFields(req.body?.fields);
       if (!name) return res.status(400).json({ ok: false, message: 'Preset name is required.' });
       if (!fields) {
-        return res.status(400).json({ ok: false, message: 'Preset must contain every Easy Prompt input.' });
+        return res.status(400).json({ ok: false, message: 'Preset must contain Easy Prompt inputs.' });
       }
-      const store = readEasyPromptPresetStore();
-      const now = new Date().toISOString();
-      const payloadBase64 = Buffer.from(JSON.stringify(fields), 'utf8').toString('base64');
       const requestedId = String(req.body?.id || '').trim();
-      const existing = store.presets.find(
+      const before = readEasyPromptPresetStore();
+      const existed = before.presets.some(
         (preset) =>
           (requestedId && String(preset?.id || '') === requestedId) ||
           String(preset?.name || '').toLocaleLowerCase() === name.toLocaleLowerCase(),
       );
-      if (existing) {
-        existing.name = name;
-        existing.updated_at = now;
-        existing.payload_base64 = payloadBase64;
-      } else {
-        store.presets.push({
-          id: randomUUID(),
-          name,
-          updated_at: now,
-          payload_base64: payloadBase64,
-        });
+      const saved = await upsertEasyPromptPreset(name, fields, requestedId);
+      if (!saved) {
+        return res.status(500).json({ ok: false, message: 'Could not save prompt preset.' });
       }
-      store.presets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-      const file = easyPromptPresetsPath();
-      await fsp.mkdir(path.dirname(file), { recursive: true });
-      await fsp.writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
-      const saved = existing || store.presets.find((preset) => preset.name === name);
       return res.json({
         ok: true,
         preset: saved,
-        message: existing ? `Updated prompt preset "${name}".` : `Saved prompt preset "${name}".`,
+        message: existed ? `Updated prompt preset "${name}".` : `Saved prompt preset "${name}".`,
       });
     } catch (e) {
       return res.status(500).json({ ok: false, message: String(e?.message || e) });
@@ -4995,6 +6671,76 @@ async function startInternalApiServer() {
       await fsp.mkdir(path.dirname(file), { recursive: true });
       await fsp.writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
       return res.json({ ok: true, message: 'Prompt preset deleted.' });
+    } catch (e) {
+      return res.status(500).json({ ok: false, message: String(e?.message || e) });
+    }
+  });
+
+  api.get('/api/sd/img2img/workflow-presets', (_req, res) => {
+    const store = readEasyWorkflowPresetStore();
+    return res.json({
+      ok: true,
+      presets: store.presets.map((preset) => ({
+        id: String(preset?.id || ''),
+        name: String(preset?.name || ''),
+        updated_at: String(preset?.updated_at || ''),
+        knobs: cleanWorkflowKnobs(preset?.knobs) || knobsFromBalance(0.35),
+      })),
+    });
+  });
+
+  api.post('/api/sd/img2img/workflow-presets', async (req, res) => {
+    try {
+      const name = String(req.body?.name || '').trim().slice(0, 80);
+      const knobs =
+        cleanWorkflowKnobs(req.body?.knobs) ||
+        knobsForNamedOrBalance(
+          req.body?.preset || req.body?.fields?.preset,
+          req.body?.fields?.balance ?? req.body?.balance,
+        );
+      if (!name) return res.status(400).json({ ok: false, message: 'Workflow preset name is required.' });
+      if (!knobs) {
+        return res
+          .status(400)
+          .json({ ok: false, message: 'Workflow preset must include knobs or a known preset/balance.' });
+      }
+      const requestedId = String(req.body?.id || '').trim();
+      const before = readEasyWorkflowPresetStore();
+      const cleanName = sanitizeWorkflowPresetName(name);
+      const existed = before.presets.some(
+        (preset) =>
+          (requestedId && String(preset?.id || '') === requestedId) ||
+          String(preset?.name || '').toLocaleLowerCase() === cleanName.toLocaleLowerCase(),
+      );
+      const saved = await upsertEasyWorkflowPreset(name, knobs, requestedId);
+      if (!saved) {
+        return res.status(500).json({ ok: false, message: 'Could not save workflow preset.' });
+      }
+      return res.json({
+        ok: true,
+        preset: saved,
+        message: existed
+          ? `Updated workflow preset "${saved.name}".`
+          : `Saved workflow preset "${saved.name}" — pick it from PRESET (next to custom).`,
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, message: String(e?.message || e) });
+    }
+  });
+
+  api.delete('/api/sd/img2img/workflow-presets/:id', async (req, res) => {
+    try {
+      const id = String(req.params?.id || '').trim();
+      const store = readEasyWorkflowPresetStore();
+      const before = store.presets.length;
+      store.presets = store.presets.filter((preset) => String(preset?.id || '') !== id);
+      if (store.presets.length === before) {
+        return res.status(404).json({ ok: false, message: 'Workflow preset not found.' });
+      }
+      const file = easyWorkflowPresetsPath();
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      await fsp.writeFile(file, JSON.stringify(store, null, 2) + '\n', 'utf8');
+      return res.json({ ok: true, message: 'Workflow preset deleted.' });
     } catch (e) {
       return res.status(500).json({ ok: false, message: String(e?.message || e) });
     }
@@ -5059,7 +6805,7 @@ async function startInternalApiServer() {
 
   api.get('/api/sd/img2img/sweep-image/*', async (req, res) => {
     const relPath = String(req.params[0] || '').replace(/\\/g, '/');
-    if (!relPath || !/\.(?:png|jpe?g|webp|enc)$/i.test(relPath)) {
+    if (!relPath || !SWEEP_IMAGE_EXT_RE.test(relPath)) {
       return res.status(400).json({ ok: false, message: 'Invalid sweep image filename.' });
     }
     if (relPath.includes('..')) {
@@ -5071,26 +6817,12 @@ async function startInternalApiServer() {
       const info = await fsp.stat(full);
       if (!info.isFile()) throw new Error('Not a file');
 
-      const rawData = fs.readFileSync(full);
-      const ENCRYPTION_KEY = 'butler-sweep-secure-key-2024';
-      if (relPath.toLowerCase().endsWith('.enc')) {
-        const decoded = Buffer.alloc(rawData.length);
-        for (let i = 0; i < rawData.length; i++) {
-          decoded[i] = rawData[i] ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length);
-        }
-        res.setHeader('Cache-Control', 'private, max-age=60');
-        res.setHeader('Content-Type', 'image/png');
-        return res.send(decoded);
-      }
-
-      const encoded = Buffer.alloc(rawData.length);
-      for (let i = 0; i < rawData.length; i++) {
-        encoded[i] = rawData[i] ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length);
-      }
-
+      // Privacy-at-rest: .enc on disk; Butler UI always receives decoded image bytes.
+      const decoded = decodeSweepImageBytes(fs.readFileSync(full), relPath);
+      const isJpeg = decoded.length >= 2 && decoded[0] === 0xff && decoded[1] === 0xd8;
       res.setHeader('Cache-Control', 'private, max-age=60');
-      res.setHeader('Content-Type', 'image/png');
-      return res.send(encoded);
+      res.setHeader('Content-Type', isJpeg ? 'image/jpeg' : 'image/png');
+      return res.send(decoded);
     } catch {
       return res.status(404).json({ ok: false, message: 'Sweep image not found.' });
     }
@@ -5099,13 +6831,15 @@ async function startInternalApiServer() {
   api.post('/api/sd/img2img/sweep-winners', async (req, res) => {
     try {
       const requested = Array.isArray(req.body?.files) ? req.body.files.map(String) : [];
+      const fallbackFields = req.body?.fallback_fields;
       const { outputRoot, sweepDir, winnersPath } = easySweepPaths();
       await fsp.mkdir(sweepDir, { recursive: true });
       const files = [];
       const presets = [];
+      const workflowPresetsSaved = [];
       for (const raw of requested) {
         const relPath = String(raw || '').replace(/\\/g, '/');
-        if (!relPath || relPath.includes('..') || !/\.(?:png|jpe?g|webp|enc)$/i.test(relPath)) continue;
+        if (!relPath || relPath.includes('..') || !SWEEP_IMAGE_EXT_RE.test(relPath)) continue;
         const preset = presetFromEasySweepFilename(relPath);
         if (!preset) continue;
         const full = path.join(sweepDir, relPath.split('/').join(path.sep));
@@ -5119,16 +6853,152 @@ async function startInternalApiServer() {
         JSON.stringify({ updated_at: new Date().toISOString(), files, presets }, null, 2) + '\n',
         'utf8',
       );
+
+      for (const relPath of files) {
+        const knobs = buildWorkflowKnobsForSavedResult(relPath, sweepDir, fallbackFields);
+        if (!knobs) continue;
+        const fileMeta = metaFromEasySweepFilename(relPath);
+        const runFields = readEasyRunMeta(sweepDir, easySweepRunGroupKey(relPath)) || fallbackFields || {};
+        const name = workflowPresetNameForResult(relPath, runFields, fileMeta);
+        const saved = await upsertEasyWorkflowPreset(name, knobs);
+        if (saved) workflowPresetsSaved.push({ id: saved.id, name: saved.name, filename: relPath });
+      }
+
+      let message = presets.length
+        ? `Saved ${files.length} winning image(s) across ${presets.length} Comfy preset(s).`
+        : 'Winner selection cleared; sweep_winners will use the default preset winners.';
+      if (workflowPresetsSaved.length) {
+        message += ` Also saved ${workflowPresetsSaved.length} workflow preset(s) — pick from PRESET (next to custom).`;
+      }
       return res.json({
         ok: true,
         files,
         presets,
-        message: presets.length
-          ? `Saved ${files.length} winning image(s) across ${presets.length} preset(s).`
-          : 'Winner selection cleared; sweep_winners will use the default preset winners.',
+        workflow_presets: workflowPresetsSaved,
+        message,
       });
     } catch (e) {
       return res.status(500).json({ ok: false, message: String(e?.message || e) });
+    }
+  });
+
+  function resolveSafeUnderSweepDir(relPath) {
+    const { sweepDir } = easySweepPaths();
+    const normalized = String(relPath || '')
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '');
+    if (!normalized || normalized.includes('..')) return null;
+    const full = path.resolve(sweepDir, ...normalized.split('/').filter(Boolean));
+    const root = path.resolve(sweepDir);
+    const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+    if (full !== root && !full.startsWith(prefix)) return null;
+    return { full, rel: normalized, sweepDir, root };
+  }
+
+  async function unlinkSweepSidecars(fullPath) {
+    const tryUnlink = async (p) => {
+      try {
+        await fsp.unlink(p);
+      } catch {
+        /* missing ok */
+      }
+    };
+    await tryUnlink(fullPath);
+    const lower = fullPath.toLowerCase();
+    if (lower.endsWith('.enc')) {
+      await tryUnlink(fullPath.slice(0, -4));
+      await tryUnlink(fullPath.slice(0, -4) + '.png');
+      await tryUnlink(fullPath.slice(0, -4) + '.jpg');
+      await tryUnlink(fullPath.slice(0, -4) + '.webp');
+    } else if (/\.(?:png|jpe?g|webp)$/i.test(fullPath)) {
+      await tryUnlink(fullPath + '.enc');
+    }
+  }
+
+  api.post('/api/sd/img2img/sweep-delete', async (req, res) => {
+    try {
+      const { sweepDir, winnersPath } = easySweepPaths();
+      const files = Array.isArray(req.body?.files) ? req.body.files.map(String) : [];
+      const runKeys = Array.isArray(req.body?.run_keys) ? req.body.run_keys.map(String) : [];
+      const deletedFiles = [];
+      const deletedRuns = [];
+
+      for (const raw of files) {
+        const resolved = resolveSafeUnderSweepDir(raw);
+        if (!resolved || !fs.existsSync(resolved.full)) continue;
+        const st = await fsp.stat(resolved.full);
+        if (!st.isFile()) continue;
+        await unlinkSweepSidecars(resolved.full);
+        deletedFiles.push(resolved.rel);
+      }
+
+      for (const rawKey of runKeys) {
+        const key = String(rawKey || '')
+          .replace(/\\/g, '/')
+          .replace(/^easy_sweep\//, '')
+          .split('/')
+          .filter(Boolean)[0];
+        if (!key || key.includes('..')) continue;
+        const resolved = resolveSafeUnderSweepDir(key);
+        if (!resolved || !fs.existsSync(resolved.full)) continue;
+        const st = await fsp.stat(resolved.full);
+        if (!st.isDirectory()) continue;
+        await fsp.rm(resolved.full, { recursive: true, force: true });
+        deletedRuns.push(key);
+      }
+
+      try {
+        const winners = readEasySweepWinners(winnersPath);
+        const runSet = new Set(deletedRuns);
+        const fileSet = new Set(deletedFiles);
+        const nextFiles = winners.files.filter((f) => {
+          const rel = String(f || '').replace(/\\/g, '/');
+          if (fileSet.has(rel)) return false;
+          const runKey = easySweepRunGroupKey(rel);
+          if (runKey && runSet.has(runKey)) return false;
+          const full = path.join(sweepDir, rel.split('/').join(path.sep));
+          return fs.existsSync(full);
+        });
+        const presets = [];
+        for (const rel of nextFiles) {
+          const preset = presetFromEasySweepFilename(rel);
+          if (preset && !presets.includes(preset)) presets.push(preset);
+        }
+        await fsp.writeFile(
+          winnersPath,
+          JSON.stringify({ updated_at: new Date().toISOString(), files: nextFiles, presets }, null, 2) + '\n',
+          'utf8',
+        );
+      } catch {
+        /* winners optional */
+      }
+
+      const parts = [];
+      if (deletedFiles.length) parts.push(`${deletedFiles.length} file(s)`);
+      if (deletedRuns.length) parts.push(`${deletedRuns.length} run folder(s)`);
+      return res.json({
+        ok: true,
+        deleted_files: deletedFiles,
+        deleted_runs: deletedRuns,
+        message: parts.length ? `Deleted ${parts.join(' and ')} from disk.` : 'Nothing to delete.',
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, message: String(e?.message || e) });
+    }
+  });
+
+  api.post('/api/sd/img2img/cancel', async (req, res) => {
+    try {
+      const r = await fetch(LOCAL_AI_URL + '/sd/img2img/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: AbortSignal.timeout(20000),
+      });
+      const data = await r.json().catch(() => ({}));
+      return res.status(r.ok ? 200 : r.status >= 400 ? r.status : 502).json(data);
+    } catch (e) {
+      return res.status(502).json({ ok: false, message: knowledgeSdUnreachableMessage(e) });
     }
   });
 
@@ -5206,8 +7076,16 @@ async function startInternalApiServer() {
       const filename = String(req.body?.filename || req.body?.upload_filename || '').trim();
       const poseImage = String(req.body?.pose_image || req.body?.pose_image_b64 || '').trim();
       const poseFilename = String(req.body?.pose_filename || req.body?.pose_upload_filename || '').trim();
-      const poseStrength = Number(req.body?.pose_strength);
-      const poseEndPercent = Number(req.body?.pose_end_percent);
+      // Forward Secret Menu Global settings (steps/cfg/size/pose). Do NOT forward
+      // likeness / pose_strength / pose_end_percent — backend bakes those; UI sliders
+      // historically diluted FaceID when this proxy passed weak values through.
+      const widthNum = Number(req.body?.width);
+      const heightNum = Number(req.body?.height);
+      const stepsNum = Number(req.body?.steps);
+      const cfgNum = Number(req.body?.cfg);
+      const seedNum = Number(req.body?.seed);
+      const cameraAngle = String(req.body?.camera_angle || req.body?.pose_camera_angle || '').trim();
+      const poseTemplate = String(req.body?.pose_template || req.body?.template || '').trim();
       const body = {
         prompt,
         init_image: initImage,
@@ -5216,8 +7094,17 @@ async function startInternalApiServer() {
         ...(filename ? { filename } : {}),
         ...(poseImage.length >= 80 ? { pose_image: poseImage } : {}),
         ...(poseFilename ? { pose_filename: poseFilename } : {}),
-        ...(Number.isFinite(poseStrength) ? { pose_strength: poseStrength } : {}),
-        ...(Number.isFinite(poseEndPercent) ? { pose_end_percent: poseEndPercent } : {}),
+        ...(Number.isFinite(widthNum) && widthNum >= 384
+          ? { width: Math.max(384, Math.min(1536, Math.round(widthNum))) }
+          : {}),
+        ...(Number.isFinite(heightNum) && heightNum >= 384
+          ? { height: Math.max(384, Math.min(1536, Math.round(heightNum))) }
+          : {}),
+        ...(Number.isFinite(stepsNum) && stepsNum > 0 ? { steps: Math.round(stepsNum) } : {}),
+        ...(Number.isFinite(cfgNum) && cfgNum > 0 ? { cfg: cfgNum } : {}),
+        ...(Number.isFinite(seedNum) && seedNum > 0 ? { seed: Math.round(seedNum) } : {}),
+        ...(cameraAngle ? { camera_angle: cameraAngle } : {}),
+        ...(poseTemplate ? { pose_template: poseTemplate } : {}),
       };
       if (req.body?.easy_prompt && typeof req.body.easy_prompt === 'object') {
         body.easy_prompt = req.body.easy_prompt;
@@ -5370,11 +7257,19 @@ async function startInternalApiServer() {
 
   return new Promise((resolve, reject) => {
     const maxRetries = app.isPackaged ? 7 : 0;
+    /** Bind all interfaces so phones on LAN can reach packaged API (:4011). */
+    const bindHost = String(process.env.BUTLER_UI_API_HOST || '0.0.0.0').trim() || '0.0.0.0';
     const tryListen = (port, remaining) => {
-      const server = api.listen(port, () => {
+      const server = api.listen(port, bindHost, () => {
         API_PORT = port;
         process.env.BUTLER_UI_API_PORT = String(API_PORT);
-        console.log('Butler internal server running at http://localhost:' + API_PORT);
+        console.log(
+          'Butler internal server running at http://' +
+            bindHost +
+            ':' +
+            API_PORT +
+            ' (localhost + LAN)',
+        );
         resolve(server);
       });
       server.on('error', (err) => {
@@ -5394,144 +7289,191 @@ async function startInternalApiServer() {
   });
 }
 
-function getButlerFloatUrl() {
+function getButlerUtilityUrl() {
   const isDev = !app.isPackaged;
   return isDev
-    ? 'http://localhost:5173/#float-butler'
-    : 'http://localhost:' + API_PORT + '/#float-butler';
+    ? 'http://localhost:5173/#agent-utility'
+    : 'http://localhost:' + API_PORT + '/#agent-utility';
 }
 
-function getButlerAgentUrl() {
+function getButlerBrowserUrl() {
   const isDev = !app.isPackaged;
   return isDev
-    ? 'http://localhost:5173/#agent'
-    : 'http://localhost:' + API_PORT + '/#agent';
+    ? 'http://localhost:5173/#agent-browser'
+    : 'http://localhost:' + API_PORT + '/#agent-browser';
 }
 
-function createButlerAgentWindow() {
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    createWindow();
+/** Hide utility window without destroying React state (reopen via secret chord only). */
+function hideButlerUtilityWindow() {
+  if (butlerUtilityWindow && !butlerUtilityWindow.isDestroyed()) {
+    butlerUtilityWindow.hide();
   }
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+}
+
+function notifyAgentBrowserState(detached) {
+  if (!butlerAgentWindow || butlerAgentWindow.isDestroyed()) return;
   try {
-    mainWindow.webContents.executeJavaScript("window.location.hash = 'agent';", true).catch(() => {});
-  } catch (_) {}
-  return mainWindow;
+    butlerAgentWindow.webContents.send(detached ? 'butler-browser-opened' : 'butler-browser-closed');
+  } catch (_) {
+    /* ignore */
+  }
 }
 
-function createButlerFloatWindow() {
-  const preloadPath = path.join(__dirname, 'preload.cjs');
-  if (butlerFloatWindow && !butlerFloatWindow.isDestroyed()) {
-    butlerFloatWindow.show();
-    return butlerFloatWindow;
+/** Hide browser window; Agent chrome re-docks the Browser tab. */
+function hideButlerBrowserWindow(opts = {}) {
+  const notify = opts.notify !== false;
+  if (butlerBrowserWindow && !butlerBrowserWindow.isDestroyed()) {
+    butlerBrowserWindow.hide();
   }
-  butlerFloatWindow = new BrowserWindow({
-    width: 304,
-    height: 340,
-    minWidth: 200,
-    minHeight: 200,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: false,
+  if (notify) notifyAgentBrowserState(false);
+}
+
+function destroyButlerBrowserWindow() {
+  if (!butlerBrowserWindow || butlerBrowserWindow.isDestroyed()) {
+    butlerBrowserWindow = null;
+    butlerBrowserForceClose = false;
+    return;
+  }
+  butlerBrowserForceClose = true;
+  try {
+    butlerBrowserWindow.destroy();
+  } catch (_) {
+    try {
+      butlerBrowserWindow.close();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  butlerBrowserWindow = null;
+  butlerBrowserForceClose = false;
+}
+
+function createButlerBrowserWindow() {
+  const preloadPath = path.join(__dirname, 'preload.cjs');
+  if (butlerBrowserWindow && !butlerBrowserWindow.isDestroyed()) {
+    if (butlerBrowserWindow.isMinimized()) butlerBrowserWindow.restore();
+    butlerBrowserWindow.show();
+    butlerBrowserWindow.focus();
+    notifyAgentBrowserState(true);
+    return butlerBrowserWindow;
+  }
+  butlerBrowserForceClose = false;
+  butlerBrowserWindow = new BrowserWindow({
+    width: 1100,
+    height: 780,
+    minWidth: 480,
+    minHeight: 360,
     resizable: true,
-    hasShadow: false,
-    backgroundColor: '#00000000',
+    title: 'Butler Browser',
+    backgroundColor: '#0d0a06',
+    autoHideMenuBar: true,
+    show: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
       preload: preloadPath,
+      webviewTag: true,
     },
   });
-  butlerFloatWindow.setAlwaysOnTop(true, 'floating');
-  if (process.platform === 'darwin') {
-    try {
-      butlerFloatWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    } catch (_) {}
-  }
-  const pt = screen.getCursorScreenPoint();
-  const b = butlerFloatWindow.getBounds();
-  butlerFloatWindow.setPosition(Math.round(pt.x - b.width / 2), Math.round(pt.y - b.height / 2));
-
-  butlerFloatWindow.loadURL(getButlerFloatUrl());
-  butlerFloatWindow.on('closed', () => {
-    butlerFloatWindow = null;
+  butlerBrowserWindow.on('close', (e) => {
+    if (butlerBrowserForceClose) return;
+    e.preventDefault();
+    // Prefer re-dock: hide OS window and tell Agent to show Browser tab again.
+    hideButlerBrowserWindow({ notify: true });
   });
-  return butlerFloatWindow;
+  butlerBrowserWindow.on('closed', () => {
+    butlerBrowserWindow = null;
+    butlerBrowserForceClose = false;
+    notifyAgentBrowserState(false);
+  });
+  butlerBrowserWindow.loadURL(getButlerBrowserUrl());
+  notifyAgentBrowserState(true);
+  return butlerBrowserWindow;
 }
 
-ipcMain.on('butler-float-sync', (_event, payload) => {
-  if (butlerFloatWindow && !butlerFloatWindow.isDestroyed()) {
-    butlerFloatWindow.webContents.send('butler-float-state', payload);
-  }
-});
-
-function computeButlerDockFlyPayload() {
-  if (!butlerFloatWindow || butlerFloatWindow.isDestroyed()) return null;
-  if (!mainWindow || mainWindow.isDestroyed()) return null;
-  try {
-    const floatB = butlerFloatWindow.getBounds();
-    const content = mainWindow.getContentBounds();
-    const cx = floatB.x + floatB.width / 2;
-    const cy = floatB.y + Math.round(floatB.height * 0.4);
-    const fromX = cx - content.x;
-    const fromY = cy - content.y;
-    const spherePx = Math.max(56, Math.min(252, Math.min(floatB.width - 36, floatB.height - 88)));
-    if (!Number.isFinite(fromX) || !Number.isFinite(fromY)) return null;
-    return { fromX, fromY, spherePx };
-  } catch (_) {
-    return null;
-  }
-}
-
-ipcMain.on('butler-float-mic-toggle', (event) => {
-  if (!butlerFloatWindow || butlerFloatWindow.isDestroyed()) return;
-  if (event.sender !== butlerFloatWindow.webContents) return;
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('butler-voice-mic-toggle');
-  }
-});
-
-ipcMain.on('butler-float-hide-request', (event) => {
-  if (!butlerFloatWindow || butlerFloatWindow.isDestroyed()) return;
-  if (event.sender !== butlerFloatWindow.webContents) return;
-  const flyPayload = computeButlerDockFlyPayload();
-  butlerFloatWindow.hide();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    if (flyPayload) {
-      mainWindow.webContents.send('butler-float-dock-fly', flyPayload);
-    } else {
-      mainWindow.webContents.send('butler-float-docked');
-    }
-  }
-});
-
-ipcMain.handle('butler-float-dock-animate', async () => {
-  if (!butlerFloatWindow || butlerFloatWindow.isDestroyed() || !butlerFloatWindow.isVisible()) {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('butler-float-docked');
-    }
+/** Tear down utility window for real (app quit or Agent window closed). */
+function destroyButlerUtilityWindow() {
+  if (!butlerUtilityWindow || butlerUtilityWindow.isDestroyed()) {
+    butlerUtilityWindow = null;
+    butlerUtilityForceClose = false;
     return;
   }
-  const flyPayload = computeButlerDockFlyPayload();
-  butlerFloatWindow.hide();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    if (flyPayload) {
-      mainWindow.webContents.send('butler-float-dock-fly', flyPayload);
-    } else {
-      mainWindow.webContents.send('butler-float-docked');
+  butlerUtilityForceClose = true;
+  try {
+    butlerUtilityWindow.destroy();
+  } catch (_) {
+    try {
+      butlerUtilityWindow.close();
+    } catch (_) {
+      /* ignore */
     }
   }
-});
+  butlerUtilityWindow = null;
+  butlerUtilityForceClose = false;
+}
 
-ipcMain.handle('butler-float-open', async () => {
-  createButlerFloatWindow();
-});
+function createButlerUtilityWindow() {
+  const preloadPath = path.join(__dirname, 'preload.cjs');
+  // Re-show existing window — do NOT reload URL (preserves studio state).
+  if (butlerUtilityWindow && !butlerUtilityWindow.isDestroyed()) {
+    if (butlerUtilityWindow.isMinimized()) butlerUtilityWindow.restore();
+    butlerUtilityWindow.show();
+    butlerUtilityWindow.focus();
+    return butlerUtilityWindow;
+  }
+  butlerUtilityForceClose = false;
+  butlerUtilityWindow = new BrowserWindow({
+    width: 920,
+    height: 780,
+    minWidth: 560,
+    minHeight: 480,
+    resizable: true,
+    title: 'Butler Utility',
+    backgroundColor: '#0d0a06',
+    autoHideMenuBar: true,
+    skipTaskbar: true,
+    show: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: preloadPath,
+      webviewTag: true,
+    },
+  });
+  // Close / Escape / Esc → hide (keep process + page state). Destroy only on app quit.
+  butlerUtilityWindow.on('close', (e) => {
+    if (butlerUtilityForceClose) return;
+    e.preventDefault();
+    butlerUtilityWindow.hide();
+  });
+  butlerUtilityWindow.on('closed', () => {
+    butlerUtilityWindow = null;
+    butlerUtilityForceClose = false;
+  });
+  butlerUtilityWindow.loadURL(getButlerUtilityUrl());
+  return butlerUtilityWindow;
+}
+
+function forwardUtilitySideSend(payload) {
+  if (!butlerAgentWindow || butlerAgentWindow.isDestroyed()) return;
+  try {
+    butlerAgentWindow.webContents.send('butler-utility-side-send', payload);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+/** Classic float mascot removed — Agent-only product. Keep IPC no-ops for older preload callers. */
+ipcMain.on('butler-float-sync', () => {});
+ipcMain.on('butler-float-mic-toggle', () => {});
+ipcMain.on('butler-float-hide-request', () => {});
+ipcMain.handle('butler-float-dock-animate', async () => {});
+ipcMain.handle('butler-float-open', async () => {});
+ipcMain.handle('butler-float-hide', async () => {});
+ipcMain.handle('butler-float-close', async () => {});
 
 ipcMain.handle('butler-agent-open', async () => {
-  createButlerAgentWindow();
+  createButlerAgentStandaloneWindow();
 });
 
 ipcMain.handle('butler-agent-popout', async () => {
@@ -5543,6 +7485,43 @@ ipcMain.handle('butler-agent-popin', async () => {
     butlerAgentWindow.close();
     butlerAgentWindow = null;
   }
+});
+
+ipcMain.handle('butler-utility-open', async () => {
+  createButlerUtilityWindow();
+});
+
+ipcMain.handle('butler-utility-close', async () => {
+  // Close button / Escape → hide only; state persists until Butler quits.
+  hideButlerUtilityWindow();
+});
+
+ipcMain.handle('butler-browser-open', async () => {
+  createButlerBrowserWindow();
+});
+
+ipcMain.handle('butler-browser-close', async () => {
+  hideButlerBrowserWindow({ notify: true });
+});
+
+ipcMain.handle('butler-browser-focus', async () => {
+  if (butlerBrowserWindow && !butlerBrowserWindow.isDestroyed()) {
+    if (butlerBrowserWindow.isMinimized()) butlerBrowserWindow.restore();
+    butlerBrowserWindow.show();
+    butlerBrowserWindow.focus();
+    return { ok: true, open: true };
+  }
+  return { ok: true, open: false };
+});
+
+ipcMain.handle('butler-utility-side-send', async (_event, payload) => {
+  const message = String(payload?.message || '').trim();
+  if (!message) return { ok: false, error: 'message required' };
+  forwardUtilitySideSend({
+    message,
+    attachment: payload?.attachment ?? null,
+  });
+  return { ok: true };
 });
 
 function createButlerAgentStandaloneWindow() {
@@ -5569,6 +7548,9 @@ function createButlerAgentStandaloneWindow() {
   });
   butlerAgentWindow.on('closed', () => {
     butlerAgentWindow = null;
+    // Agent gone → destroy utility + browser (session ends); state clears with the app process.
+    destroyButlerUtilityWindow();
+    destroyButlerBrowserWindow();
   });
   const isDev = !app.isPackaged;
   if (isDev) {
@@ -5578,6 +7560,20 @@ function createButlerAgentStandaloneWindow() {
   }
   return butlerAgentWindow;
 }
+
+ipcMain.handle('butler-agent-reload', async () => {
+  try {
+    const win =
+      (typeof butlerAgentWindow !== 'undefined' && butlerAgentWindow && !butlerAgentWindow.isDestroyed()
+        ? butlerAgentWindow
+        : null) || BrowserWindow.getFocusedWindow();
+    if (!win || win.isDestroyed()) return { ok: false, error: 'no agent window' };
+    win.webContents.reloadIgnoringCache();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+});
 
 ipcMain.handle('butler-open-external-url', async (_event, targetUrl) => {
   const url = String(targetUrl || '').trim();
@@ -5611,61 +7607,54 @@ ipcMain.handle('butler-agent-open-explorer', async (_event, targetPath) => {
   return { ok: true, path: p };
 });
 
-ipcMain.handle('butler-float-hide', async () => {
-  if (butlerFloatWindow && !butlerFloatWindow.isDestroyed()) {
-    butlerFloatWindow.hide();
+ipcMain.handle('butler-screen-sources', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      // Tiny thumbs — used only for source listing, never shown as a live preview.
+      thumbnailSize: { width: 1, height: 1 },
+    });
+    return {
+      ok: true,
+      sources: (sources || []).map((s) => ({
+        id: s.id,
+        name: s.name || 'Screen',
+      })),
+    };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err), sources: [] };
   }
 });
-
-ipcMain.handle('butler-float-close', async () => {
-  if (butlerFloatWindow && !butlerFloatWindow.isDestroyed()) {
-    butlerFloatWindow.close();
-    butlerFloatWindow = null;
-  }
-});
-
-function createWindow() {
-  const preloadPath = path.join(__dirname, 'preload.cjs');
-  mainWindow = new BrowserWindow({
-    width: 1320,
-    height: 860,
-    minWidth: 980,
-    minHeight: 640,
-    title: 'Butler',
-    backgroundColor: '#0d0a06',
-    autoHideMenuBar: true,
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      preload: preloadPath,
-      webviewTag: true,
-    },
-  });
-
-  mainWindow.on('close', () => {
-    if (butlerFloatWindow && !butlerFloatWindow.isDestroyed()) {
-      butlerFloatWindow.close();
-      butlerFloatWindow = null;
-    }
-  });
-
-  mainWindow.on('closed', () => {
-    mainWindow = null;
-  });
-
-  const isDev = !app.isPackaged;
-  if (isDev) {
-    mainWindow.loadURL('http://localhost:5173');
-  } else {
-    mainWindow.loadURL('http://localhost:' + API_PORT);
-  }
-}
 
 app.whenReady().then(async () => {
+  try {
+    loadAndApplyAgentEnvVarsElectron();
+  } catch (_) {}
+
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     const allowed = ['media', 'microphone', 'audioCapture', 'display-capture'];
     callback(allowed.includes(permission));
   });
+
+  // Prefer whole-screen capture for Agent screen assist (getDisplayMedia / silent buffer).
+  try {
+    session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+      try {
+        const sources = await desktopCapturer.getSources({
+          types: ['screen'],
+          thumbnailSize: { width: 1, height: 1 },
+        });
+        const pick =
+          sources.find((s) => /entire screen|screen 1|display 1/i.test(s.name || '')) || sources[0];
+        if (pick) callback({ video: pick });
+        else callback({});
+      } catch {
+        callback({});
+      }
+    });
+  } catch (_) {
+    /* older Electron */
+  }
 
   try {
     await prepareRuntimePorts();
@@ -5685,7 +7674,7 @@ app.whenReady().then(async () => {
   }
   if (app.isPackaged) {
     startInternalApiServer()
-      .then(() => (AGENT_ONLY ? createButlerAgentStandaloneWindow() : createWindow()))
+      .then(() => createButlerAgentStandaloneWindow())
       .catch((err) => {
         console.error('Failed to start internal server:', err);
         const { dialog } = require('electron');
@@ -5708,10 +7697,14 @@ app.whenReady().then(async () => {
         }
       }
       await ensureDevButlerApi();
-      if (AGENT_ONLY) createButlerAgentStandaloneWindow();
-      else createWindow();
+      createButlerAgentStandaloneWindow();
     })();
   }
+});
+
+app.on('before-quit', () => {
+  destroyButlerUtilityWindow();
+  destroyButlerBrowserWindow();
 });
 
 app.on('will-quit', () => {
@@ -5725,7 +7718,7 @@ app.on('will-quit', () => {
 
 app.on('window-all-closed', () => {
   if (butlerAgentWindow && !butlerAgentWindow.isDestroyed()) {
-    // Keep the standalone agent window alive when the main window closes.
+    // Keep the Agent window alive when utility/browser popouts close.
     return;
   }
   if (aiServerProcess) {
